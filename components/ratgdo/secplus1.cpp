@@ -16,6 +16,13 @@ namespace secplus1 {
     using namespace scheduler_ids;
     static const char* const TAG = "ratgdo_secplus1";
     static constexpr uint32_t DOOR_STATE_CALLBACK_TIMEOUT = 2000;
+    static constexpr uint32_t DOOR_ACTION_DEFER_TIMEOUT = 22000;
+    static constexpr uint32_t DOOR_ACTION_POST_TOGGLE_QUERY_DELAY = 1200;
+    // Pre-toggle bus warm-up (approach #1 for the command-miss regression): wake the
+    // opener's receiver with a short QUERY_DOOR_STATUS burst before the button press
+    // so a single clean press lands instead of being dropped into an idle bus.
+    static constexpr uint8_t DOOR_PRESS_WARMUP_QUERIES = 3;
+    static constexpr uint32_t DOOR_PRESS_WARMUP_INTERVAL = 200; // ms between warm-up queries and before the press
     // If no passive door-status poll has been observed for this long, assume no
     // capable panel is supplying door status and resume active probing. 3x the
     // 0x37 panel's ~10s poll interval, so an occasional missed poll won't trip it.
@@ -123,6 +130,7 @@ namespace secplus1 {
         this->wall_panel_emulation_state_ = WallPanelEmulationState::WAITING;
         this->wall_panel_emulation_start_ = millis();
         this->flags_.wall_panel_starting = false;
+        this->clear_deferred_door_action_();
         this->door_state = DoorState::UNKNOWN;
         this->light_state = LightState::UNKNOWN;
         this->scheduler_->cancel_timeout(this->ratgdo_, TIMEOUT_WALL_PANEL_EMULATION);
@@ -313,10 +321,131 @@ namespace secplus1 {
         this->scheduler_->cancel_timeout(this->ratgdo_, TIMEOUT_DOOR_STATE_EXPIRY);
     }
 
+    void Secplus1::clear_deferred_door_action_()
+    {
+        this->scheduler_->cancel_timeout(this->ratgdo_, TIMEOUT_DEFERRED_DOOR_ACTION);
+        this->pending_door_action_ = DoorAction::UNKNOWN;
+        this->pending_door_action_since_ = 0;
+    }
+
+    bool Secplus1::door_action_satisfied_(DoorAction action, DoorState state) const
+    {
+        if (action == DoorAction::OPEN) {
+            return state == DoorState::OPEN || state == DoorState::OPENING;
+        }
+        if (action == DoorAction::CLOSE) {
+            return state == DoorState::CLOSED || state == DoorState::CLOSING;
+        }
+        return false;
+    }
+
+    void Secplus1::defer_door_action_(DoorAction action)
+    {
+        this->pending_door_action_ = action;
+        this->pending_door_action_since_ = millis();
+
+        ESP_LOGW(TAG, "DOOR_ACTION_DEFER action=%s timeout=%ums door=%s maybe=%s pending_tx=%u",
+            LOG_STR_ARG(DoorAction_to_string(action)),
+            (unsigned)DOOR_ACTION_DEFER_TIMEOUT,
+            LOG_STR_ARG(DoorState_to_string(this->door_state)),
+            LOG_STR_ARG(DoorState_to_string(this->maybe_door_state)),
+            (unsigned)this->pending_tx_.size());
+        char detail[72];
+        snprintf(detail, sizeof(detail), "action=%s timeout=%ums", LOG_STR_ARG(DoorAction_to_string(action)), (unsigned)DOOR_ACTION_DEFER_TIMEOUT);
+        this->set_debug_summary_("DOOR_ACTION_DEFER", detail);
+
+        this->scheduler_->set_timeout(this->ratgdo_, TIMEOUT_DEFERRED_DOOR_ACTION, DOOR_ACTION_DEFER_TIMEOUT, [this]() {
+            if (this->pending_door_action_ == DoorAction::UNKNOWN) {
+                return;
+            }
+
+            const uint32_t pending_age = millis() - this->pending_door_action_since_;
+            const auto action = this->pending_door_action_;
+            ESP_LOGW(TAG, "DOOR_ACTION_DEFER_EXPIRED action=%s age=%ums door=%s maybe=%s",
+                LOG_STR_ARG(DoorAction_to_string(action)),
+                (unsigned)pending_age,
+                LOG_STR_ARG(DoorState_to_string(this->door_state)),
+                LOG_STR_ARG(DoorState_to_string(this->maybe_door_state)));
+            char detail[72];
+            snprintf(detail, sizeof(detail), "action=%s age=%ums", LOG_STR_ARG(DoorAction_to_string(action)), (unsigned)pending_age);
+            this->set_debug_summary_("DOOR_ACTION_DEFER_EXPIRED", detail);
+            this->pending_door_action_ = DoorAction::UNKNOWN;
+            this->pending_door_action_since_ = 0;
+        });
+
+        if (this->pending_tx_.empty() && this->wall_panel_emulation_state_ != WallPanelEmulationState::RUNNING) {
+            this->enqueue_transmit(CommandType::QUERY_DOOR_STATUS);
+        }
+    }
+
+    void Secplus1::maybe_run_deferred_door_action_()
+    {
+        if (this->pending_door_action_ == DoorAction::UNKNOWN) {
+            return;
+        }
+
+        const uint32_t pending_age = millis() - this->pending_door_action_since_;
+        const auto action = this->pending_door_action_;
+        if (pending_age >= DOOR_ACTION_DEFER_TIMEOUT) {
+            ESP_LOGW(TAG, "DOOR_ACTION_DEFER_EXPIRED action=%s age=%ums door=%s maybe=%s",
+                LOG_STR_ARG(DoorAction_to_string(action)),
+                (unsigned)pending_age,
+                LOG_STR_ARG(DoorState_to_string(this->door_state)),
+                LOG_STR_ARG(DoorState_to_string(this->maybe_door_state)));
+            char detail[72];
+            snprintf(detail, sizeof(detail), "action=%s age=%ums", LOG_STR_ARG(DoorAction_to_string(action)), (unsigned)pending_age);
+            this->set_debug_summary_("DOOR_ACTION_DEFER_EXPIRED", detail);
+            this->clear_deferred_door_action_();
+            return;
+        }
+
+        if (this->door_state == DoorState::UNKNOWN) {
+            return;
+        }
+
+        if (this->door_action_satisfied_(action, this->door_state)) {
+            ESP_LOGI(TAG, "DOOR_ACTION_DEFER_SATISFIED action=%s age=%ums door=%s",
+                LOG_STR_ARG(DoorAction_to_string(action)),
+                (unsigned)pending_age,
+                LOG_STR_ARG(DoorState_to_string(this->door_state)));
+            this->clear_deferred_door_action_();
+            return;
+        }
+
+        const bool can_run_action = (action == DoorAction::OPEN
+                                        && (this->door_state == DoorState::CLOSED || this->door_state == DoorState::CLOSING || this->door_state == DoorState::STOPPED))
+            || (action == DoorAction::CLOSE
+                && (this->door_state == DoorState::OPEN || this->door_state == DoorState::OPENING || this->door_state == DoorState::STOPPED));
+        if (!can_run_action) {
+            ESP_LOGW(TAG, "DOOR_ACTION_DEFER_DROP action=%s age=%ums door=%s maybe=%s",
+                LOG_STR_ARG(DoorAction_to_string(action)),
+                (unsigned)pending_age,
+                LOG_STR_ARG(DoorState_to_string(this->door_state)),
+                LOG_STR_ARG(DoorState_to_string(this->maybe_door_state)));
+            char detail[72];
+            snprintf(detail, sizeof(detail), "action=%s state=%s", LOG_STR_ARG(DoorAction_to_string(action)), LOG_STR_ARG(DoorState_to_string(this->door_state)));
+            this->set_debug_summary_("DOOR_ACTION_DEFER_DROP", detail);
+            this->clear_deferred_door_action_();
+            return;
+        }
+
+        ESP_LOGI(TAG, "DOOR_ACTION_DEFER_RUN action=%s age=%ums door=%s",
+            LOG_STR_ARG(DoorAction_to_string(action)),
+            (unsigned)pending_age,
+            LOG_STR_ARG(DoorState_to_string(this->door_state)));
+        this->clear_deferred_door_action_();
+        this->door_action(action);
+    }
+
     void Secplus1::door_action(DoorAction action)
     {
         ESP_LOG1(TAG, "Door action: %s, door state: %s", LOG_STR_ARG(DoorAction_to_string(action)), LOG_STR_ARG(DoorState_to_string(this->door_state)));
         if (action == DoorAction::UNKNOWN) {
+            return;
+        }
+
+        if ((action == DoorAction::OPEN || action == DoorAction::CLOSE) && this->door_state == DoorState::UNKNOWN) {
+            this->defer_door_action_(action);
             return;
         }
 
@@ -391,8 +520,29 @@ namespace secplus1 {
             wall_panel_emulation_state_to_cstr(this->wall_panel_emulation_state_),
             this->flags_.is_0x37_panel);
         this->set_debug_summary_("DOOR_TOGGLE_ENQUEUE");
-        this->enqueue_transmit(CommandType::TOGGLE_DOOR_PRESS);
-        this->enqueue_transmit(CommandType::QUERY_DOOR_STATUS);
+        // Pre-toggle bus warm-up (approach #1 for the command-miss regression):
+        // emit a short QUERY_DOOR_STATUS burst to wake the opener's receiver, THEN
+        // the single button press. On a basic panel the bus is otherwise idle and
+        // the first press into silence is dropped (~1/3); stock firmware stayed in
+        // continuous emulation polling, which kept the receiver awake. The press is
+        // scheduled after the burst; the priority queue orders by time so the
+        // warm-up queries always transmit first. Release + post-toggle queries are
+        // scheduled by enqueue_command_pair when the press actually transmits.
+        //
+        // SKIP the warm-up when the door is already moving (OPENING/CLOSING): the bus
+        // is already warm from motion traffic (2.5s probe + post-toggle queries) so
+        // the receiver is awake, and the corrective toggles of the Sec+1 single-button
+        // direction dance (see door_action STOP / OPEN-from-STOPPED) must land
+        // promptly to minimize wrong-direction overshoot.
+        auto now = millis();
+        uint32_t press_delay = 0;
+        if (this->door_state != DoorState::OPENING && this->door_state != DoorState::CLOSING) {
+            for (uint8_t i = 0; i < DOOR_PRESS_WARMUP_QUERIES; i++) {
+                this->enqueue_transmit(CommandType::QUERY_DOOR_STATUS, now + i * DOOR_PRESS_WARMUP_INTERVAL);
+            }
+            press_delay = DOOR_PRESS_WARMUP_QUERIES * DOOR_PRESS_WARMUP_INTERVAL;
+        }
+        this->enqueue_transmit(CommandType::TOGGLE_DOOR_PRESS, now + press_delay);
         if (this->door_state == DoorState::STOPPED || this->door_state == DoorState::OPEN || this->door_state == DoorState::CLOSED) {
             this->flags_.door_moving = true;
         }
@@ -404,6 +554,9 @@ namespace secplus1 {
             ESP_LOGI(TAG, "CALL_QUERY_STATUS enqueueing door/other/obstruction status queries");
             this->set_debug_summary_("CALL_QUERY_STATUS");
             this->enqueue_transmit(CommandType::QUERY_DOOR_STATUS);
+            // Second QUERY_DOOR_STATUS 2.5s later so the two-confirmation gate
+            // can commit state from a single manual query-status press.
+            this->enqueue_transmit(CommandType::QUERY_DOOR_STATUS, millis() + 2500);
             this->enqueue_transmit(CommandType::QUERY_OTHER_STATUS, millis() + 300);
             this->enqueue_transmit(CommandType::OBSTRUCTION, millis() + 600);
         }
@@ -567,6 +720,14 @@ namespace secplus1 {
                 ESP_LOGI(TAG, "DOOR_STATUS_MAYBE candidate=%s waiting_for_second_match", LOG_STR_ARG(DoorState_to_string(door_state)));
                 this->set_debug_summary_("DOOR_STATUS_MAYBE", detail);
             } else {
+                // Two consecutive identical reads confirm state — but if both reads were
+                // UNKNOWN (e.g. resp=0xFF bus noise) and we already hold a real physical
+                // state, discard: noise should not erase confirmed truth.
+                if (door_state == DoorState::UNKNOWN && this->door_state != DoorState::UNKNOWN) {
+                    ESP_LOGW(TAG, "DOOR_STATUS_NOISE two UNKNOWN reads discarded, keeping %s", LOG_STR_ARG(DoorState_to_string(this->door_state)));
+                    this->maybe_door_state = this->door_state;
+                    return;
+                }
                 this->maybe_door_state = door_state;
                 this->door_state = door_state;
                 if (this->door_state == DoorState::STOPPED || this->door_state == DoorState::OPEN || this->door_state == DoorState::CLOSED) {
@@ -575,6 +736,7 @@ namespace secplus1 {
                 ESP_LOGI(TAG, "DOOR_STATUS_CONFIRMED state=%s door_moving=%u", LOG_STR_ARG(DoorState_to_string(door_state)), this->flags_.door_moving);
                 this->set_debug_summary_("DOOR_STATUS_CONFIRMED", detail);
                 this->ratgdo_->received(door_state);
+                this->maybe_run_deferred_door_action_();
             }
         } else if (cmd.req == CommandType::QUERY_DOOR_STATUS_0x37) {
             this->flags_.is_0x37_panel = true;
@@ -657,6 +819,8 @@ namespace secplus1 {
         auto now = millis();
         if (cmd == CommandType::TOGGLE_DOOR_PRESS) {
             this->enqueue_transmit(CommandType::TOGGLE_DOOR_RELEASE, now + 500);
+            this->enqueue_transmit(CommandType::QUERY_DOOR_STATUS, now + DOOR_ACTION_POST_TOGGLE_QUERY_DELAY);
+            this->enqueue_transmit(CommandType::QUERY_DOOR_STATUS, now + DOOR_ACTION_POST_TOGGLE_QUERY_DELAY + 2500);
         } else if (cmd == CommandType::TOGGLE_LIGHT_PRESS) {
             this->enqueue_transmit(CommandType::TOGGLE_LIGHT_RELEASE, now + 500);
         } else if (cmd == CommandType::TOGGLE_LOCK_PRESS) {

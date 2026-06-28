@@ -153,6 +153,10 @@ namespace secplus1 {
         void toggle_lock();
         void toggle_door();
         void query_status();
+        void clear_deferred_door_action_();
+        void defer_door_action_(DoorAction action);
+        void maybe_run_deferred_door_action_();
+        bool door_action_satisfied_(DoorAction action, DoorState state) const;
         void set_debug_summary_(const char* event);
         void set_debug_summary_(const char* event, const char* detail);
 
@@ -171,6 +175,7 @@ namespace secplus1 {
         // capable wall panel polling door position). 0 = never seen. Used to
         // suppress active probing while something else is supplying door status.
         uint32_t last_passive_door_status_ { 0 };
+        uint32_t pending_door_action_since_ { 0 };
 
         // Larger structures
         std::priority_queue<TxCommand, std::vector<TxCommand>, FirstToSend> pending_tx_;
@@ -190,6 +195,7 @@ namespace secplus1 {
         LightState maybe_light_state { LightState::UNKNOWN };
         LockState maybe_lock_state { LockState::UNKNOWN };
         DoorState maybe_door_state { DoorState::UNKNOWN };
+        DoorAction pending_door_action_ { DoorAction::UNKNOWN };
         WallPanelEmulationState wall_panel_emulation_state_ { WallPanelEmulationState::WAITING };
         struct {
             uint8_t door_moving : 1;
