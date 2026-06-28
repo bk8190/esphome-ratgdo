@@ -106,6 +106,7 @@ namespace protocol {
         virtual void on_shutdown() { }
 
         virtual void sync();
+        virtual const char* debug_summary() const { return ""; }
 
         // dry contact methods
         virtual void set_open_limit(bool);

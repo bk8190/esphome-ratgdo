@@ -285,6 +285,7 @@ public:
     void query_status();
     void query_openings();
     void sync();
+    const char* debug_summary() const { return this->protocol_ == nullptr ? "" : this->protocol_->debug_summary(); }
 
     using Component::cancel_interval;
     using Component::set_interval;
@@ -527,6 +528,7 @@ namespace scheduler_ids {
         TIMEOUT_PRESENCE_DETECT_WINDOW,
         TIMEOUT_CLEAR_PRESENCE,
         TIMEOUT_WALL_PANEL_EMULATION,
+        TIMEOUT_DOOR_PROBE,
         TIMEOUT_SYNC,
         INTERVAL_STATUS_WATCHDOG,
         TIMEOUT_ENCODER_STOPPED,

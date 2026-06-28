@@ -120,6 +120,7 @@ namespace secplus1 {
         Result call(Args args);
 
         const Traits& traits() const { return this->traits_; }
+        const char* debug_summary() const override { return this->debug_summary_; }
 
         // methods not used by secplus1
         void set_open_limit(bool state) { }
@@ -129,6 +130,10 @@ namespace secplus1 {
 
     protected:
         void wall_panel_emulation(size_t index = 0);
+        // Active door-status acquisition for non-0x37 panels: while door_state
+        // is UNKNOWN, periodically inject QUERY_DOOR_STATUS instead of only
+        // waiting to overhear a passive poll that may never come.
+        void door_status_probe_();
 
         optional<RxCommand> read_command();
         void handle_command(const RxCommand& cmd);
@@ -148,6 +153,8 @@ namespace secplus1 {
         void toggle_lock();
         void toggle_door();
         void query_status();
+        void set_debug_summary_(const char* event);
+        void set_debug_summary_(const char* event, const char* detail);
 
         // Pointers first (4-byte aligned)
         InternalGPIOPin* tx_pin_;
@@ -166,6 +173,7 @@ namespace secplus1 {
         RatgdoUART uart_;
         OnceCallbacks<void(DoorState)> on_door_state_;
         Traits traits_;
+        char debug_summary_[192] { "boot" };
 
         // rx parsing state
         RxPacket rx_packet_;

@@ -17,6 +17,50 @@ namespace secplus1 {
     static const char* const TAG = "ratgdo_secplus1";
     static constexpr uint32_t DOOR_STATE_CALLBACK_TIMEOUT = 2000;
 
+    const char* wall_panel_emulation_state_to_cstr(WallPanelEmulationState state)
+    {
+        switch (state) {
+        case WallPanelEmulationState::WAITING:
+            return "WAITING";
+        case WallPanelEmulationState::RUNNING:
+            return "RUNNING";
+        default:
+            return "UNKNOWN";
+        }
+    }
+
+    void Secplus1::set_debug_summary_(const char* event)
+    {
+        snprintf(this->debug_summary_, sizeof(this->debug_summary_),
+            "%lu %s door=%s maybe=%s light=%s wall=%s is37=%u rx_age=%lu tx_age=%lu q=%u",
+            (unsigned long)millis(),
+            event,
+            LOG_STR_ARG(DoorState_to_string(this->door_state)),
+            LOG_STR_ARG(DoorState_to_string(this->maybe_door_state)),
+            LOG_STR_ARG(LightState_to_string(this->light_state)),
+            wall_panel_emulation_state_to_cstr(this->wall_panel_emulation_state_),
+            this->flags_.is_0x37_panel,
+            this->last_rx_ == 0 ? 0UL : (unsigned long)(millis() - this->last_rx_),
+            this->last_tx_ == 0 ? 0UL : (unsigned long)(millis() - this->last_tx_),
+            (unsigned)this->pending_tx_.size());
+    }
+
+    void Secplus1::set_debug_summary_(const char* event, const char* detail)
+    {
+        snprintf(this->debug_summary_, sizeof(this->debug_summary_),
+            "%lu %s %s door=%s maybe=%s wall=%s is37=%u rx_age=%lu tx_age=%lu q=%u",
+            (unsigned long)millis(),
+            event,
+            detail,
+            LOG_STR_ARG(DoorState_to_string(this->door_state)),
+            LOG_STR_ARG(DoorState_to_string(this->maybe_door_state)),
+            wall_panel_emulation_state_to_cstr(this->wall_panel_emulation_state_),
+            this->flags_.is_0x37_panel,
+            this->last_rx_ == 0 ? 0UL : (unsigned long)(millis() - this->last_rx_),
+            this->last_tx_ == 0 ? 0UL : (unsigned long)(millis() - this->last_tx_),
+            (unsigned)this->pending_tx_.size());
+    }
+
     void Secplus1::setup(RATGDOComponent* ratgdo, Scheduler* scheduler, InternalGPIOPin* rx_pin, InternalGPIOPin* tx_pin)
     {
         this->ratgdo_ = ratgdo;
@@ -25,6 +69,8 @@ namespace secplus1 {
         this->rx_pin_ = rx_pin;
 
         this->uart_.begin(1200, RATGDO_UART_8E1, rx_pin->get_pin(), tx_pin->get_pin(), true);
+        ESP_LOGI(TAG, "SEC+1 debug build active: rx_pin=%d tx_pin=%d baud=1200 inverted=1", rx_pin->get_pin(), tx_pin->get_pin());
+        this->set_debug_summary_("SETUP");
 
         this->traits_.set_features(HAS_DOOR_STATUS | HAS_LIGHT_TOGGLE | HAS_LOCK_TOGGLE);
     }
@@ -57,6 +103,19 @@ namespace secplus1 {
 
     void Secplus1::sync()
     {
+        ESP_LOGI(TAG,
+            "SYNC_START door=%s maybe_door=%s light=%s maybe_light=%s wall_state=%s is_0x37=%u door_moving=%u pending_tx=%u last_rx_age=%ums last_tx_age=%ums",
+            LOG_STR_ARG(DoorState_to_string(this->door_state)),
+            LOG_STR_ARG(DoorState_to_string(this->maybe_door_state)),
+            LOG_STR_ARG(LightState_to_string(this->light_state)),
+            LOG_STR_ARG(LightState_to_string(this->maybe_light_state)),
+            wall_panel_emulation_state_to_cstr(this->wall_panel_emulation_state_),
+            this->flags_.is_0x37_panel,
+            this->flags_.door_moving,
+            (unsigned)this->pending_tx_.size(),
+            this->last_rx_ == 0 ? 0 : millis() - this->last_rx_,
+            this->last_tx_ == 0 ? 0 : millis() - this->last_tx_);
+        this->set_debug_summary_("SYNC_START");
         this->wall_panel_emulation_state_ = WallPanelEmulationState::WAITING;
         this->wall_panel_emulation_start_ = millis();
         this->flags_.wall_panel_starting = false;
@@ -67,25 +126,90 @@ namespace secplus1 {
 
         this->ratgdo_->set_timeout(45000, [this] {
             if (this->door_state == DoorState::UNKNOWN) {
-                ESP_LOGW(TAG, "Triggering sync failed actions.");
+                ESP_LOGW(TAG,
+                    "SYNC_FAIL door=%s maybe_door=%s light=%s maybe_light=%s wall_state=%s wall_elapsed=%ums is_0x37=%u wall_panel_starting=%u door_moving=%u pending_tx=%u last_rx_age=%ums last_tx_age=%ums",
+                    LOG_STR_ARG(DoorState_to_string(this->door_state)),
+                    LOG_STR_ARG(DoorState_to_string(this->maybe_door_state)),
+                    LOG_STR_ARG(LightState_to_string(this->light_state)),
+                    LOG_STR_ARG(LightState_to_string(this->maybe_light_state)),
+                    wall_panel_emulation_state_to_cstr(this->wall_panel_emulation_state_),
+                    millis() - this->wall_panel_emulation_start_,
+                    this->flags_.is_0x37_panel,
+                    this->flags_.wall_panel_starting,
+                    this->flags_.door_moving,
+                    (unsigned)this->pending_tx_.size(),
+                    this->last_rx_ == 0 ? 0 : millis() - this->last_rx_,
+                    this->last_tx_ == 0 ? 0 : millis() - this->last_tx_);
+                this->set_debug_summary_("SYNC_FAIL");
                 this->ratgdo_->sync_failed = true;
             }
         });
+
+        // Kick off active door-status probing while we don't yet know the door
+        // position. Non-0x37 wall panels never poll door status, so passively
+        // waiting can leave door_state UNKNOWN forever after a reboot.
+        // 15s delay lets the API server finish its first connection handshake
+        // before we start transmitting on the bus (SoftSerial ISR can disrupt
+        // lwIP packet processing on ESP8266 during the critical connect window).
+        this->scheduler_->set_timeout(this->ratgdo_, TIMEOUT_DOOR_PROBE, 15000, [this] {
+            this->door_status_probe_();
+        });
+    }
+
+    void Secplus1::door_status_probe_()
+    {
+        // Actively ask the opener for door status instead of only overhearing a
+        // passive poll that may never come. enqueue_transmit + loop() handle the
+        // bus-gap timing the same way toggle_door and the 0x37 path already do.
+        // 0x37 panels already inject in handle_command(), so skip them here.
+        if (!this->flags_.is_0x37_panel
+            && this->door_state == DoorState::UNKNOWN
+            && this->wall_panel_emulation_state_ != WallPanelEmulationState::RUNNING
+            && this->pending_tx_.empty()) {
+            ESP_LOGI(TAG, "DOOR_PROBE door=UNKNOWN -> QUERY_DOOR_STATUS (is37=%u wall=%s)",
+                this->flags_.is_0x37_panel,
+                wall_panel_emulation_state_to_cstr(this->wall_panel_emulation_state_));
+            this->set_debug_summary_("DOOR_PROBE");
+            this->enqueue_transmit(CommandType::QUERY_DOOR_STATUS);
+        }
+        // Keep probing only while the door position is still unknown.
+        if (this->door_state == DoorState::UNKNOWN) {
+            this->scheduler_->set_timeout(this->ratgdo_, TIMEOUT_DOOR_PROBE, 2500, [this] {
+                this->door_status_probe_();
+            });
+        }
     }
 
     void Secplus1::wall_panel_emulation(size_t index)
     {
         if (this->flags_.wall_panel_starting) {
+            ESP_LOGI(TAG, "WALL_PANEL_STARTING observed; returning to WAITING");
+            this->set_debug_summary_("WALL_PANEL_STARTING");
             this->wall_panel_emulation_state_ = WallPanelEmulationState::WAITING;
         } else if (this->wall_panel_emulation_state_ == WallPanelEmulationState::WAITING) {
-            ESP_LOGD(TAG, "Looking for security+ 1.0 wall panel...");
+            ESP_LOGI(TAG,
+                "WALL_WAIT elapsed=%ums door=%s light=%s maybe_door=%s maybe_light=%s is_0x37=%u last_rx_age=%ums last_tx_age=%ums",
+                millis() - this->wall_panel_emulation_start_,
+                LOG_STR_ARG(DoorState_to_string(this->door_state)),
+                LOG_STR_ARG(LightState_to_string(this->light_state)),
+                LOG_STR_ARG(DoorState_to_string(this->maybe_door_state)),
+                LOG_STR_ARG(LightState_to_string(this->maybe_light_state)),
+                this->flags_.is_0x37_panel,
+                this->last_rx_ == 0 ? 0 : millis() - this->last_rx_,
+                this->last_tx_ == 0 ? 0 : millis() - this->last_tx_);
+            this->set_debug_summary_("WALL_WAIT");
 
             if (this->door_state != DoorState::UNKNOWN || this->light_state != LightState::UNKNOWN) {
-                ESP_LOG1(TAG, "Wall panel detected");
+                ESP_LOGI(TAG, "WALL_DETECTED door=%s light=%s elapsed=%ums",
+                    LOG_STR_ARG(DoorState_to_string(this->door_state)),
+                    LOG_STR_ARG(LightState_to_string(this->light_state)),
+                    millis() - this->wall_panel_emulation_start_);
+                this->set_debug_summary_("WALL_DETECTED");
                 return;
             }
             if (millis() - this->wall_panel_emulation_start_ > 35000 && !this->flags_.wall_panel_starting) {
-                ESP_LOGD(TAG, "No wall panel detected. Switching to emulation mode.");
+                ESP_LOGW(TAG, "WALL_NOT_DETECTED switching_to_emulation elapsed=%ums", millis() - this->wall_panel_emulation_start_);
+                this->set_debug_summary_("WALL_NOT_DETECTED");
                 this->wall_panel_emulation_state_ = WallPanelEmulationState::RUNNING;
             }
             this->scheduler_->set_timeout(this->ratgdo_, TIMEOUT_WALL_PANEL_EMULATION, 2000, [this] {
@@ -94,10 +218,13 @@ namespace secplus1 {
             return;
         } else if (this->wall_panel_emulation_state_ == WallPanelEmulationState::RUNNING) {
 #ifdef USE_ESP8266
-            // ESP_LOG2(TAG, "[Wall panel emulation] Sending byte: [%02X]", progmem_read_byte(&secplus1_states[index]));
+            uint8_t emu_byte = progmem_read_byte(&secplus1_states[index]);
 #else
-            // ESP_LOG2(TAG, "[Wall panel emulation] Sending byte: [%02X]", secplus1_states[index]);
+            uint8_t emu_byte = secplus1_states[index];
 #endif
+            if (emu_byte == 0x38 || emu_byte == 0x39 || emu_byte == 0x3A) {
+                ESP_LOGD(TAG, "WALL_EMU status_byte=0x%02X index=%u pending_tx=%u", emu_byte, (unsigned)index, (unsigned)this->pending_tx_.size());
+            }
 
             if (index < 15 || !this->do_transmit_if_pending()) {
 #ifdef USE_ESP8266
@@ -121,6 +248,7 @@ namespace secplus1 {
 
                 index += 1;
                 if (index == 18) {
+                    ESP_LOGD(TAG, "WALL_EMU loop rollover to status-only section");
                     index = 15;
                 }
             }
@@ -239,6 +367,12 @@ namespace secplus1 {
 
     void Secplus1::toggle_door()
     {
+        ESP_LOGW(TAG, "DOOR_TOGGLE_ENQUEUE current_door=%s maybe_door=%s wall_state=%s is_0x37=%u",
+            LOG_STR_ARG(DoorState_to_string(this->door_state)),
+            LOG_STR_ARG(DoorState_to_string(this->maybe_door_state)),
+            wall_panel_emulation_state_to_cstr(this->wall_panel_emulation_state_),
+            this->flags_.is_0x37_panel);
+        this->set_debug_summary_("DOOR_TOGGLE_ENQUEUE");
         this->enqueue_transmit(CommandType::TOGGLE_DOOR_PRESS);
         this->enqueue_transmit(CommandType::QUERY_DOOR_STATUS);
         if (this->door_state == DoorState::STOPPED || this->door_state == DoorState::OPEN || this->door_state == DoorState::CLOSED) {
@@ -248,6 +382,13 @@ namespace secplus1 {
 
     Result Secplus1::call(Args args)
     {
+        if (args.tag == Args::Tag::query_status) {
+            ESP_LOGI(TAG, "CALL_QUERY_STATUS enqueueing door/other/obstruction status queries");
+            this->set_debug_summary_("CALL_QUERY_STATUS");
+            this->enqueue_transmit(CommandType::QUERY_DOOR_STATUS);
+            this->enqueue_transmit(CommandType::QUERY_OTHER_STATUS, millis() + 300);
+            this->enqueue_transmit(CommandType::OBSTRUCTION, millis() + 600);
+        }
         return { };
     }
 
@@ -336,6 +477,7 @@ namespace secplus1 {
     optional<RxCommand> Secplus1::decode_packet(const RxPacket& packet) const
     {
         CommandType cmd_type = to_CommandType(packet[0], CommandType::UNKNOWN);
+        ESP_LOGD(TAG, "RX_DECODE req=0x%02X(%s) resp=0x%02X", packet[0], LOG_STR_ARG(CommandType_to_string(cmd_type)), packet[1]);
         return RxCommand { cmd_type, packet[1] };
     }
 
@@ -348,9 +490,17 @@ namespace secplus1 {
 
     void Secplus1::handle_command(const RxCommand& cmd)
     {
+        ESP_LOGD(TAG, "RX_HANDLE req=%s resp=0x%02X wall_state=%s is_0x37=%u door=%s maybe_door=%s",
+            LOG_STR_ARG(CommandType_to_string(cmd.req)),
+            cmd.resp,
+            wall_panel_emulation_state_to_cstr(this->wall_panel_emulation_state_),
+            this->flags_.is_0x37_panel,
+            LOG_STR_ARG(DoorState_to_string(this->door_state)),
+            LOG_STR_ARG(DoorState_to_string(this->maybe_door_state)));
         if (cmd.req == CommandType::TOGGLE_DOOR_RELEASE || cmd.resp == 0x31) {
             if (this->wall_panel_emulation_state_ == WallPanelEmulationState::WAITING) {
-                ESP_LOGD(TAG, "wall panel is starting");
+                ESP_LOGI(TAG, "WALL_PANEL_START_MARKER req=%s resp=0x%02X", LOG_STR_ARG(CommandType_to_string(cmd.req)), cmd.resp);
+                this->set_debug_summary_("WALL_PANEL_START_MARKER");
                 this->flags_.wall_panel_starting = true;
             }
         } else if (cmd.req == CommandType::QUERY_DOOR_STATUS) {
@@ -377,35 +527,65 @@ namespace secplus1 {
                 door_state = DoorState::UNKNOWN;
             }
 
+            ESP_LOGI(TAG,
+                "DOOR_STATUS resp=0x%02X low_bits=0x%X decoded=%s previous=%s maybe_previous=%s is_0x37=%u",
+                cmd.resp,
+                val,
+                LOG_STR_ARG(DoorState_to_string(door_state)),
+                LOG_STR_ARG(DoorState_to_string(this->door_state)),
+                LOG_STR_ARG(DoorState_to_string(this->maybe_door_state)),
+                this->flags_.is_0x37_panel);
+            char detail[48];
+            snprintf(detail, sizeof(detail), "resp=0x%02X bits=0x%X decoded=%s", cmd.resp, val, LOG_STR_ARG(DoorState_to_string(door_state)));
+            this->set_debug_summary_("DOOR_STATUS", detail);
+
             if (this->maybe_door_state != door_state) {
+                ESP_LOGD(TAG, "DOOR_STATUS triggering pending callback with candidate=%s", LOG_STR_ARG(DoorState_to_string(door_state)));
                 this->on_door_state_.trigger(door_state);
             }
 
             if (!this->flags_.is_0x37_panel && door_state != this->maybe_door_state) {
                 this->maybe_door_state = door_state;
-                ESP_LOG1(TAG, "Door maybe %s, waiting for 2nd status message to confirm", LOG_STR_ARG(DoorState_to_string(door_state)));
+                ESP_LOGI(TAG, "DOOR_STATUS_MAYBE candidate=%s waiting_for_second_match", LOG_STR_ARG(DoorState_to_string(door_state)));
+                this->set_debug_summary_("DOOR_STATUS_MAYBE", detail);
             } else {
                 this->maybe_door_state = door_state;
                 this->door_state = door_state;
                 if (this->door_state == DoorState::STOPPED || this->door_state == DoorState::OPEN || this->door_state == DoorState::CLOSED) {
                     this->flags_.door_moving = false;
                 }
+                ESP_LOGI(TAG, "DOOR_STATUS_CONFIRMED state=%s door_moving=%u", LOG_STR_ARG(DoorState_to_string(door_state)), this->flags_.door_moving);
+                this->set_debug_summary_("DOOR_STATUS_CONFIRMED", detail);
                 this->ratgdo_->received(door_state);
             }
         } else if (cmd.req == CommandType::QUERY_DOOR_STATUS_0x37) {
             this->flags_.is_0x37_panel = true;
+            ESP_LOGI(TAG, "PANEL_0X37_STATUS req_seen resp=0x%02X door_moving=%u last_status_query_age=%ums",
+                cmd.resp,
+                this->flags_.door_moving,
+                this->last_status_query_ == 0 ? 0 : millis() - this->last_status_query_);
+            this->set_debug_summary_("PANEL_0X37_STATUS");
             auto cmd = this->pending_tx();
             if (cmd && cmd.value() == CommandType::TOGGLE_LOCK_PRESS) {
+                ESP_LOGD(TAG, "PANEL_0X37 pending lock toggle; transmitting pending command");
                 this->do_transmit_if_pending();
             } else {
                 // inject door status request
                 if (flags_.door_moving || (millis() - this->last_status_query_ > 10000)) {
+                    ESP_LOGI(TAG, "PANEL_0X37 injecting QUERY_DOOR_STATUS");
+                    this->set_debug_summary_("PANEL_0X37_QUERY");
                     this->transmit_byte(static_cast<uint8_t>(CommandType::QUERY_DOOR_STATUS));
                     this->last_status_query_ = millis();
                 }
             }
         } else if (cmd.req == CommandType::QUERY_OTHER_STATUS) {
             LightState light_state = to_LightState((cmd.resp >> 2) & 1, LightState::UNKNOWN);
+            ESP_LOGD(TAG, "OTHER_STATUS resp=0x%02X light=%s maybe_light=%s lock_bit_state=%s maybe_lock=%s",
+                cmd.resp,
+                LOG_STR_ARG(LightState_to_string(light_state)),
+                LOG_STR_ARG(LightState_to_string(this->maybe_light_state)),
+                LOG_STR_ARG(LockState_to_string(to_LockState((~cmd.resp >> 3) & 1, LockState::UNKNOWN))),
+                LOG_STR_ARG(LockState_to_string(this->maybe_lock_state)));
 
             if (!this->flags_.is_0x37_panel && light_state != this->maybe_light_state) {
                 this->maybe_light_state = light_state;
@@ -423,6 +603,7 @@ namespace secplus1 {
             }
         } else if (cmd.req == CommandType::OBSTRUCTION) {
             ObstructionState obstruction_state = cmd.resp == 0 ? ObstructionState::CLEAR : ObstructionState::OBSTRUCTED;
+            ESP_LOGD(TAG, "OBSTRUCTION_STATUS resp=0x%02X state=%s", cmd.resp, LOG_STR_ARG(ObstructionState_to_string(obstruction_state)));
             this->ratgdo_->received(obstruction_state);
         } else if (cmd.req == CommandType::TOGGLE_LIGHT_PRESS) {
             // motion was detected, or the light toggle button was pressed
@@ -441,6 +622,7 @@ namespace secplus1 {
     {
         auto cmd = this->pop_pending_tx();
         if (cmd) {
+            ESP_LOGD(TAG, "TX_PENDING cmd=%s remaining_after_pop=%u", LOG_STR_ARG(CommandType_to_string(cmd.value())), (unsigned)this->pending_tx_.size());
             this->enqueue_command_pair(cmd.value());
             this->transmit_byte(static_cast<uint32_t>(cmd.value()));
         }
@@ -464,6 +646,13 @@ namespace secplus1 {
         if (time == 0) {
             time = millis();
         }
+        ESP_LOGD(TAG, "TX_ENQUEUE cmd=%s scheduled_in=%dms queue_before=%u",
+            LOG_STR_ARG(CommandType_to_string(cmd)),
+            (int)(time - millis()),
+            (unsigned)this->pending_tx_.size());
+        char detail[64];
+        snprintf(detail, sizeof(detail), "cmd=%s in=%dms", LOG_STR_ARG(CommandType_to_string(cmd)), (int)(time - millis()));
+        this->set_debug_summary_("TX_ENQUEUE", detail);
         this->pending_tx_.push(TxCommand { cmd, time });
     }
 
@@ -491,6 +680,15 @@ namespace secplus1 {
     void Secplus1::transmit_byte(uint32_t value)
     {
         bool enable_rx = (value == 0x38) || (value == 0x39) || (value == 0x3A);
+        ESP_LOGI(TAG, "TX_BYTE value=0x%02X(%s) enable_rx=%u wall_state=%s queue=%u",
+            (unsigned)value,
+            LOG_STR_ARG(CommandType_to_string(to_CommandType(static_cast<uint8_t>(value), CommandType::UNKNOWN))),
+            enable_rx,
+            wall_panel_emulation_state_to_cstr(this->wall_panel_emulation_state_),
+            (unsigned)this->pending_tx_.size());
+        char detail[64];
+        snprintf(detail, sizeof(detail), "value=0x%02X enable_rx=%u", (unsigned)value, enable_rx);
+        this->set_debug_summary_("TX_BYTE", detail);
         if (!enable_rx) {
             this->uart_.enableIntTx(false);
         }

@@ -4,13 +4,8 @@ esphome:
 
 external_components:
   - source:
-      type: git
-      url: https://github.com/ratgdo/esphome-ratgdo
-      ref: main
-    refresh: 1s
-  # - source:
-  #     type: local
-  #     path: components
+      type: local
+      path: /config/esphome/ratgdo-debug/components
 
 safe_mode:
 
@@ -21,6 +16,13 @@ text_sensor:
   - platform: version
     id: ${id_prefix}_firmware_version
     name: "Firmware Version"
+  - platform: template
+    id: ${id_prefix}_secplus1_debug_summary
+    name: "SEC+1 Debug Summary"
+    entity_category: diagnostic
+    update_interval: 2s
+    lambda: |-
+      return {id(${id_prefix}).debug_summary()};
 
 ratgdo:
   id: ${id_prefix}
@@ -40,8 +42,6 @@ ratgdo:
 ota:
   - platform: esphome
     id: ${id_prefix}_ratgdo_ota
-  - platform: web_server
-    id: ${id_prefix}_ratgdo_ota_ws
 
 lock:
   - platform: ratgdo
