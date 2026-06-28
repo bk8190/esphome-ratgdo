@@ -16,6 +16,10 @@ namespace secplus1 {
     using namespace scheduler_ids;
     static const char* const TAG = "ratgdo_secplus1";
     static constexpr uint32_t DOOR_STATE_CALLBACK_TIMEOUT = 2000;
+    // If no passive door-status poll has been observed for this long, assume no
+    // capable panel is supplying door status and resume active probing. 3x the
+    // 0x37 panel's ~10s poll interval, so an occasional missed poll won't trip it.
+    static constexpr uint32_t DOOR_STATUS_PASSIVE_TIMEOUT = 30000;
 
     const char* wall_panel_emulation_state_to_cstr(WallPanelEmulationState state)
     {
@@ -158,26 +162,40 @@ namespace secplus1 {
 
     void Secplus1::door_status_probe_()
     {
-        // Actively ask the opener for door status instead of only overhearing a
-        // passive poll that may never come. enqueue_transmit + loop() handle the
-        // bus-gap timing the same way toggle_door and the 0x37 path already do.
-        // 0x37 panels already inject in handle_command(), so skip them here.
-        if (!this->flags_.is_0x37_panel
-            && this->door_state == DoorState::UNKNOWN
+        // Probe only when nothing else is supplying door status. If a capable
+        // panel has polled door position recently (last_passive_door_status_),
+        // ratgdo already has a live source of truth and stays dormant. This is
+        // determined entirely from observed bus traffic — no configuration — and
+        // self-corrects: if passive polls stop arriving, probing resumes.
+        const bool passive_source_present = this->last_passive_door_status_ != 0
+            && (millis() - this->last_passive_door_status_) < DOOR_STATUS_PASSIVE_TIMEOUT;
+
+        // Basic wall panels never poll door status, so ratgdo has no passive
+        // source: such an install is otherwise dead-reckoning from its own
+        // commands and drifts stale on reboots and out-of-band operations
+        // (wall-panel button, RF remote, mechanical). Actively query the opener to
+        // keep state grounded in reality. enqueue_transmit + loop() handle bus-gap
+        // timing the same way toggle_door and the 0x37 path already do.
+        if (!passive_source_present
             && this->wall_panel_emulation_state_ != WallPanelEmulationState::RUNNING
             && this->pending_tx_.empty()) {
-            ESP_LOGI(TAG, "DOOR_PROBE door=UNKNOWN -> QUERY_DOOR_STATUS (is37=%u wall=%s)",
-                this->flags_.is_0x37_panel,
+            ESP_LOGI(TAG, "DOOR_PROBE door=%s -> QUERY_DOOR_STATUS (moving=%u wall=%s)",
+                LOG_STR_ARG(DoorState_to_string(this->door_state)),
+                this->flags_.door_moving,
                 wall_panel_emulation_state_to_cstr(this->wall_panel_emulation_state_));
             this->set_debug_summary_("DOOR_PROBE");
             this->enqueue_transmit(CommandType::QUERY_DOOR_STATUS);
         }
-        // Keep probing only while the door position is still unknown.
-        if (this->door_state == DoorState::UNKNOWN) {
-            this->scheduler_->set_timeout(this->ratgdo_, TIMEOUT_DOOR_PROBE, 2500, [this] {
-                this->door_status_probe_();
-            });
-        }
+        // Probe fast while we don't know the state or the door is moving (quick
+        // post-reboot heal and quick settle), then drop to a low background rate
+        // to bound staleness. The loop is kept alive even when a passive source is
+        // present (cheap timer + compare) so probing can resume if it disappears.
+        // Self-sustaining single timer (same scheduler key replaces the prior one).
+        uint32_t next_ms = (this->door_state == DoorState::UNKNOWN || this->flags_.door_moving)
+            ? 2500 : 10000;
+        this->scheduler_->set_timeout(this->ratgdo_, TIMEOUT_DOOR_PROBE, next_ms, [this] {
+            this->door_status_probe_();
+        });
     }
 
     void Secplus1::wall_panel_emulation(size_t index)
@@ -560,6 +578,11 @@ namespace secplus1 {
             }
         } else if (cmd.req == CommandType::QUERY_DOOR_STATUS_0x37) {
             this->flags_.is_0x37_panel = true;
+            // A capable panel is actively polling door status, so ratgdo has a
+            // live passive source of truth and need not probe. Stamp the time so
+            // the probe stays dormant while polls keep arriving, and resumes on
+            // its own if they stop (panel removed/failed).
+            this->last_passive_door_status_ = millis();
             ESP_LOGI(TAG, "PANEL_0X37_STATUS req_seen resp=0x%02X door_moving=%u last_status_query_age=%ums",
                 cmd.resp,
                 this->flags_.door_moving,

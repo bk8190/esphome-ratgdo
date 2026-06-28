@@ -167,6 +167,10 @@ namespace secplus1 {
         uint32_t last_rx_ { 0 };
         uint32_t last_tx_ { 0 };
         uint32_t last_status_query_ { 0 };
+        // millis() of the last passive door-status poll observed on the bus (a
+        // capable wall panel polling door position). 0 = never seen. Used to
+        // suppress active probing while something else is supplying door status.
+        uint32_t last_passive_door_status_ { 0 };
 
         // Larger structures
         std::priority_queue<TxCommand, std::vector<TxCommand>, FirstToSend> pending_tx_;
