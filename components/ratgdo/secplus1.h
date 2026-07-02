@@ -129,6 +129,10 @@ namespace secplus1 {
 
     protected:
         void wall_panel_emulation(size_t index = 0);
+        // Active door-status acquisition for panels that never poll door status:
+        // periodically inject QUERY_DOOR_STATUS instead of only waiting to
+        // overhear a passive poll that may never come.
+        void door_status_probe_();
 
         optional<RxCommand> read_command();
         void handle_command(const RxCommand& cmd);
@@ -148,6 +152,10 @@ namespace secplus1 {
         void toggle_lock();
         void toggle_door();
         void query_status();
+        void clear_deferred_door_action_();
+        void defer_door_action_(DoorAction action);
+        void maybe_run_deferred_door_action_();
+        bool door_action_satisfied_(DoorAction action, DoorState state) const;
 
         // Pointers first (4-byte aligned)
         InternalGPIOPin* tx_pin_;
@@ -160,6 +168,11 @@ namespace secplus1 {
         uint32_t last_rx_ { 0 };
         uint32_t last_tx_ { 0 };
         uint32_t last_status_query_ { 0 };
+        // millis() of the last passive door-status poll observed on the bus (a
+        // capable wall panel polling door position). 0 = never seen. Used to
+        // suppress active probing while something else is supplying door status.
+        uint32_t last_passive_door_status_ { 0 };
+        uint32_t pending_door_action_since_ { 0 };
 
         // Larger structures
         std::priority_queue<TxCommand, std::vector<TxCommand>, FirstToSend> pending_tx_;
@@ -178,6 +191,7 @@ namespace secplus1 {
         LightState maybe_light_state { LightState::UNKNOWN };
         LockState maybe_lock_state { LockState::UNKNOWN };
         DoorState maybe_door_state { DoorState::UNKNOWN };
+        DoorAction pending_door_action_ { DoorAction::UNKNOWN };
         WallPanelEmulationState wall_panel_emulation_state_ { WallPanelEmulationState::WAITING };
         struct {
             uint8_t door_moving : 1;

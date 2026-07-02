@@ -743,11 +743,9 @@ void RATGDOComponent::door_open()
             [this]() {
                 if (*this->door_state != DoorState::OPEN
                     && *this->door_state != DoorState::STOPPED
-#ifdef RATGDO_USE_ENCODER
-                    // If the encoder confirmed CLOSED the door did not open silently;
+                    // If the protocol confirmed CLOSED, the door did not open silently;
                     // don't override with a spurious OPEN assumption.
                     && *this->door_state != DoorState::CLOSED
-#endif
                 ) {
                     this->received(DoorState::OPEN); // probably missed a status message,
                                                      // assume it's open
