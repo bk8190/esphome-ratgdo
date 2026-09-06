@@ -23,6 +23,22 @@ namespace secplus1 {
     // instead of being dropped into an idle bus.
     static constexpr uint8_t DOOR_PRESS_WARMUP_QUERIES = 3;
     static constexpr uint32_t DOOR_PRESS_WARMUP_INTERVAL = 200; // ms between warm-up queries and before the press
+    static constexpr uint8_t DOOR_COMMAND_BASELINE_CONFIRMATIONS = 2;
+    static constexpr uint32_t DOOR_COMMAND_RETRY_MIN_DELAY = 3000;
+    // Watch verdicts consume only two-read-confirmed states, and one noise read
+    // resets the confirmation gate (costing ~2 extra reads at the 2.5s probe
+    // cadence), so the window must fit 2 confirmed baseline reads plus one
+    // noise-flip recovery after the ~0.6s warm-up burst.
+    static constexpr uint32_t DOOR_COMMAND_WATCH_TIMEOUT = 12000;
+    // After a door toggle transmits, re-query the opener once the door should
+    // have finished travelling and authoritatively re-confirm the settled end
+    // state. The post-toggle queries at ~1.2s/3.7s only catch the door mid-
+    // travel; without a late verify a transient/garbled read committed during a
+    // messy command (e.g. a mid-motion reversal) can stick as the wrong end
+    // state. Delay covers typical residential door travel with margin; the
+    // verify enqueues two queries so the two-confirmation gate commits truth.
+    static constexpr uint32_t DOOR_COMMAND_VERIFY_DELAY = 22000;
+    static constexpr uint32_t DOOR_COMMAND_VERIFY_SECOND_QUERY = 2500;
     // If no passive door-status poll has been observed for this long, assume no
     // capable panel is supplying door status and resume active probing. 3x the
     // 0x37 panel's ~10s poll interval, so an occasional missed poll won't trip it.
@@ -72,9 +88,11 @@ namespace secplus1 {
         this->wall_panel_emulation_start_ = millis();
         this->flags_.wall_panel_starting = false;
         this->clear_deferred_door_action_();
+        this->clear_door_command_watch_();
         this->door_state = DoorState::UNKNOWN;
         this->light_state = LightState::UNKNOWN;
         this->scheduler_->cancel_timeout(this->ratgdo_, TIMEOUT_WALL_PANEL_EMULATION);
+        this->scheduler_->cancel_timeout(this->ratgdo_, TIMEOUT_DOOR_COMMAND_VERIFY);
         this->wall_panel_emulation();
 
         this->ratgdo_->set_timeout(45000, [this] {
@@ -115,12 +133,17 @@ namespace secplus1 {
             ESP_LOGD(TAG, "Probing door status, door state: %s", LOG_STR_ARG(DoorState_to_string(this->door_state)));
             this->enqueue_transmit(CommandType::QUERY_DOOR_STATUS);
         }
-        // Probe fast while we don't know the state or the door is moving (quick
-        // post-reboot heal and quick settle), then drop to a low background rate
-        // to bound staleness. The loop is kept alive even when a passive source is
-        // present (cheap timer + compare) so probing can resume if it disappears.
-        // Self-sustaining single timer (same scheduler key replaces the prior one).
-        uint32_t next_ms = (this->door_state == DoorState::UNKNOWN || this->flags_.door_moving)
+        // Probe fast while we don't know the state, the door is moving, or a
+        // correction is pending — an unconfirmed candidate (maybe_door_state)
+        // disagrees with the currently held state, so a second confirming read
+        // lands quickly and overturns a stale/wrong commit in ~2.5s instead of a
+        // full background cycle (quick post-reboot heal and quick settle). Then
+        // drop to a low background rate to bound staleness. The loop is kept
+        // alive even when a passive source is present (cheap timer + compare) so
+        // probing can resume if it disappears. Self-sustaining single timer
+        // (same scheduler key replaces the prior one).
+        const bool correction_pending = this->maybe_door_state != this->door_state;
+        uint32_t next_ms = (this->door_state == DoorState::UNKNOWN || this->flags_.door_moving || correction_pending)
             ? 2500 : 10000;
         this->scheduler_->set_timeout(this->ratgdo_, TIMEOUT_DOOR_PROBE, next_ms, [this] {
             this->door_status_probe_();
@@ -239,6 +262,157 @@ namespace secplus1 {
         return false;
     }
 
+    void Secplus1::log_door_command_stats_(const char* outcome) const
+    {
+        ESP_LOGI(TAG,
+            "Door command recovery %s: attempts=%u misses=%u retries=%u retry_failures=%u unverified=%u duplicates_suppressed=%u",
+            outcome,
+            this->door_command_attempts_,
+            this->door_command_misses_,
+            this->door_command_retries_,
+            this->door_command_retry_failures_,
+            this->door_command_unverified_,
+            this->door_command_duplicates_suppressed_);
+    }
+
+    void Secplus1::publish_door_command_stats_()
+    {
+        this->ratgdo_->received(DoorCommandStats {
+            this->door_command_retries_,
+            this->door_command_retry_failures_,
+            this->door_command_unverified_,
+            this->door_command_duplicates_suppressed_ });
+    }
+
+    void Secplus1::clear_door_command_watch_()
+    {
+        this->scheduler_->cancel_timeout(this->ratgdo_, TIMEOUT_DOOR_COMMAND_WATCH);
+        this->watched_door_action_ = DoorAction::UNKNOWN;
+        this->watched_door_baseline_ = DoorState::UNKNOWN;
+        this->door_command_sent_at_ = 0;
+        this->flags_.door_command_retried = false;
+        this->flags_.door_command_baseline_reads = 0;
+    }
+
+    bool Secplus1::arm_door_command_watch_(DoorAction action, DoorState baseline_state)
+    {
+        // Recovery is only safe for an idempotent directional request from a
+        // known end stop. A raw TOGGLE or a command while stopped/moving has no
+        // safe automatic retry direction.
+        if (this->flags_.is_0x37_panel
+            || !((action == DoorAction::OPEN && baseline_state == DoorState::CLOSED)
+                || (action == DoorAction::CLOSE && baseline_state == DoorState::OPEN))) {
+            return true;
+        }
+
+        if (this->watched_door_action_ == action) {
+            this->door_command_duplicates_suppressed_++;
+            this->log_door_command_stats_("duplicate suppressed");
+            this->publish_door_command_stats_();
+            return false;
+        }
+
+        this->clear_door_command_watch_();
+        this->watched_door_action_ = action;
+        this->watched_door_baseline_ = baseline_state;
+        this->door_command_attempts_++;
+        // Failsafe scheduled at arm time, not transmit time: a press that never
+        // makes it onto the bus would otherwise leave the watch armed forever,
+        // duplicate-suppressing every later command in the same direction.
+        // mark_door_command_transmitted_ re-schedules from actual transmit.
+        this->schedule_door_command_watch_timeout_();
+        return true;
+    }
+
+    void Secplus1::schedule_post_command_verify_()
+    {
+        // Fire once, after expected travel, regardless of what state the command
+        // sequence committed in the meantime. Two queries a couple seconds apart
+        // feed the two-confirmation gate so a genuine settled end state commits
+        // (and overturns any transient/garbled mid-command commit). Self-
+        // replacing timer: repeated presses (retry, STOP direction sequences)
+        // just push the single verify out to after the last press.
+        this->scheduler_->set_timeout(this->ratgdo_, TIMEOUT_DOOR_COMMAND_VERIFY, DOOR_COMMAND_VERIFY_DELAY, [this]() {
+            ESP_LOGD(TAG, "Post-command verify: re-querying door end state (held %s)", LOG_STR_ARG(DoorState_to_string(this->door_state)));
+            auto now = millis();
+            this->enqueue_transmit(CommandType::QUERY_DOOR_STATUS, now);
+            this->enqueue_transmit(CommandType::QUERY_DOOR_STATUS, now + DOOR_COMMAND_VERIFY_SECOND_QUERY);
+        });
+    }
+
+    void Secplus1::schedule_door_command_watch_timeout_()
+    {
+        this->scheduler_->set_timeout(this->ratgdo_, TIMEOUT_DOOR_COMMAND_WATCH, DOOR_COMMAND_WATCH_TIMEOUT, [this]() {
+            if (this->watched_door_action_ == DoorAction::UNKNOWN) {
+                return;
+            }
+            this->door_command_unverified_++;
+            this->log_door_command_stats_("inconclusive");
+            this->clear_door_command_watch_();
+            this->publish_door_command_stats_();
+        });
+    }
+
+    void Secplus1::mark_door_command_transmitted_()
+    {
+        if (this->watched_door_action_ == DoorAction::UNKNOWN || this->door_command_sent_at_ != 0) {
+            return;
+        }
+
+        this->door_command_sent_at_ = millis();
+        this->flags_.door_command_baseline_reads = 0;
+        this->schedule_door_command_watch_timeout_();
+    }
+
+    void Secplus1::observe_door_command_status_(DoorState state)
+    {
+        if (this->watched_door_action_ == DoorAction::UNKNOWN || this->door_command_sent_at_ == 0 || state == DoorState::UNKNOWN) {
+            return;
+        }
+
+        if (state != this->watched_door_baseline_) {
+            this->log_door_command_stats_(this->flags_.door_command_retried ? "recovered" : "confirmed");
+            this->clear_door_command_watch_();
+            return;
+        }
+
+        if (this->flags_.door_command_baseline_reads < DOOR_COMMAND_BASELINE_CONFIRMATIONS) {
+            this->flags_.door_command_baseline_reads++;
+        }
+        if (this->flags_.door_command_baseline_reads < DOOR_COMMAND_BASELINE_CONFIRMATIONS
+            || (millis() - this->door_command_sent_at_) < DOOR_COMMAND_RETRY_MIN_DELAY) {
+            return;
+        }
+
+        if (this->flags_.door_command_retried) {
+            this->door_command_retry_failures_++;
+            this->log_door_command_stats_("retry failed");
+            this->clear_door_command_watch_();
+            this->publish_door_command_stats_();
+            return;
+        }
+
+        // Never stack recovery traffic on another queued action. Without two
+        // fresh, valid baseline replies and an empty queue, the result is
+        // inconclusive rather than permission to transmit another toggle.
+        if (!this->pending_tx_.empty() || this->wall_panel_emulation_state_ == WallPanelEmulationState::RUNNING) {
+            this->door_command_unverified_++;
+            this->log_door_command_stats_("retry blocked");
+            this->clear_door_command_watch_();
+            this->publish_door_command_stats_();
+            return;
+        }
+
+        this->door_command_misses_++;
+        this->door_command_retries_++;
+        this->publish_door_command_stats_();
+        this->flags_.door_command_retried = true;
+        this->door_command_sent_at_ = 0;
+        this->flags_.door_command_baseline_reads = 0;
+        this->log_door_command_stats_("miss confirmed; retrying once");
+        this->toggle_door();
+    }
+
     void Secplus1::defer_door_action_(DoorAction action)
     {
         this->pending_door_action_ = action;
@@ -316,6 +490,9 @@ namespace secplus1 {
             this->toggle_door();
         } else if (action == DoorAction::OPEN) {
             if (this->door_state == DoorState::CLOSED || this->door_state == DoorState::CLOSING) {
+                if (!this->arm_door_command_watch_(action, this->door_state)) {
+                    return;
+                }
                 this->toggle_door();
             } else if (this->door_state == DoorState::STOPPED) {
                 this->toggle_door(); // this starts closing door
@@ -336,6 +513,9 @@ namespace secplus1 {
             }
         } else if (action == DoorAction::CLOSE) {
             if (this->door_state == DoorState::OPEN) {
+                if (!this->arm_door_command_watch_(action, this->door_state)) {
+                    return;
+                }
                 this->toggle_door();
             } else if (this->door_state == DoorState::OPENING) {
                 this->toggle_door(); // this switches to stopped
@@ -541,6 +721,19 @@ namespace secplus1 {
                 door_state = DoorState::UNKNOWN;
             }
 
+            // A single UNKNOWN (garbled/noise) read must not disturb a real
+            // state we already hold or a real candidate we are confirming.
+            // Otherwise a lone noise read between two good reads resets the
+            // two-confirmation gate every cycle, which can wedge a stale wrong
+            // state indefinitely because a correcting read never gets to land
+            // twice in a row (observed 2026-07-15: ~34min stuck CLOSED while
+            // physically OPEN). Ignore it and wait for the next real read.
+            if (door_state == DoorState::UNKNOWN && this->door_state != DoorState::UNKNOWN) {
+                ESP_LOGD(TAG, "Ignoring UNKNOWN door status read (noise), keeping %s (pending %s)",
+                    LOG_STR_ARG(DoorState_to_string(this->door_state)), LOG_STR_ARG(DoorState_to_string(this->maybe_door_state)));
+                return;
+            }
+
             if (this->maybe_door_state != door_state) {
                 this->on_door_state_.trigger(door_state);
             }
@@ -549,20 +742,18 @@ namespace secplus1 {
                 this->maybe_door_state = door_state;
                 ESP_LOG1(TAG, "Door maybe %s, waiting for 2nd status message to confirm", LOG_STR_ARG(DoorState_to_string(door_state)));
             } else {
-                // Two consecutive identical reads confirm state — but if both reads were
-                // UNKNOWN (e.g. resp=0xFF bus noise) and we already hold a real physical
-                // state, discard: noise should not erase confirmed truth.
-                if (door_state == DoorState::UNKNOWN && this->door_state != DoorState::UNKNOWN) {
-                    ESP_LOGD(TAG, "Discarding two UNKNOWN door status reads, keeping %s", LOG_STR_ARG(DoorState_to_string(this->door_state)));
-                    this->maybe_door_state = this->door_state;
-                    return;
-                }
                 this->maybe_door_state = door_state;
                 this->door_state = door_state;
                 if (this->door_state == DoorState::STOPPED || this->door_state == DoorState::OPEN || this->door_state == DoorState::CLOSED) {
                     this->flags_.door_moving = false;
                 }
                 this->ratgdo_->received(door_state);
+                // The command watch only trusts state that survived the
+                // two-confirmation gate above: a single garbled read must not
+                // clear the watch as "confirmed" (door moved) any more than it
+                // may commit state to HA. Runs before the deferred-action
+                // dispatch so the old watch settles before a new one can arm.
+                this->observe_door_command_status_(door_state);
                 this->maybe_run_deferred_door_action_();
             }
         } else if (cmd.req == CommandType::QUERY_DOOR_STATUS_0x37) {
@@ -629,9 +820,11 @@ namespace secplus1 {
     {
         auto now = millis();
         if (cmd == CommandType::TOGGLE_DOOR_PRESS) {
+            this->mark_door_command_transmitted_();
             this->enqueue_transmit(CommandType::TOGGLE_DOOR_RELEASE, now + 500);
             this->enqueue_transmit(CommandType::QUERY_DOOR_STATUS, now + DOOR_ACTION_POST_TOGGLE_QUERY_DELAY);
             this->enqueue_transmit(CommandType::QUERY_DOOR_STATUS, now + DOOR_ACTION_POST_TOGGLE_QUERY_DELAY + 2500);
+            this->schedule_post_command_verify_();
         } else if (cmd == CommandType::TOGGLE_LIGHT_PRESS) {
             this->enqueue_transmit(CommandType::TOGGLE_LIGHT_RELEASE, now + 500);
         } else if (cmd == CommandType::TOGGLE_LOCK_PRESS) {

@@ -145,6 +145,10 @@ public:
     single_observable<uint8_t> paired_keypads { PAIRED_DEVICES_UNKNOWN };
     single_observable<uint8_t> paired_wall_controls { PAIRED_DEVICES_UNKNOWN };
     single_observable<uint8_t> paired_accessories { PAIRED_DEVICES_UNKNOWN };
+    single_observable<uint32_t> door_command_recoveries { 0 };
+    single_observable<uint32_t> door_command_retry_failures { 0 };
+    single_observable<uint32_t> door_command_unverified { 0 };
+    single_observable<uint32_t> door_command_suppressed { 0 };
 
     observable<DoorState, RATGDO_MAX_DOOR_STATE_SUBSCRIBERS> door_state { DoorState::UNKNOWN };
     observable<float, RATGDO_MAX_DOOR_STATE_SUBSCRIBERS> door_position { DOOR_POSITION_UNKNOWN };
@@ -211,6 +215,7 @@ public:
     void received(const TimeToClose ttc);
     void received(const PairedDeviceCount pdc);
     void received(const BatteryState pdc);
+    void received(const DoorCommandStats stats);
 
     // door
     void door_toggle();
@@ -355,6 +360,14 @@ public:
     void subscribe_paired_wall_controls(F&& f);
     template <typename F>
     void subscribe_paired_accessories(F&& f);
+    template <typename F>
+    void subscribe_door_command_recoveries(F&& f);
+    template <typename F>
+    void subscribe_door_command_retry_failures(F&& f);
+    template <typename F>
+    void subscribe_door_command_unverified(F&& f);
+    template <typename F>
+    void subscribe_door_command_suppressed(F&& f);
     template <typename F>
     void subscribe_door_state(F&& f);
     template <typename F>
@@ -507,6 +520,10 @@ namespace scheduler_ids {
         DEFER_PAIRED_KEYPADS,
         DEFER_PAIRED_WALL_CONTROLS,
         DEFER_PAIRED_ACCESSORIES,
+        DEFER_DOOR_COMMAND_RECOVERIES,
+        DEFER_DOOR_COMMAND_RETRY_FAILURES,
+        DEFER_DOOR_COMMAND_UNVERIFIED,
+        DEFER_DOOR_COMMAND_SUPPRESSED,
         DEFER_LIGHT_STATE,
         DEFER_LOCK_STATE,
         DEFER_OBSTRUCTION_STATE,
@@ -529,6 +546,8 @@ namespace scheduler_ids {
         TIMEOUT_WALL_PANEL_EMULATION,
         TIMEOUT_DOOR_PROBE,
         TIMEOUT_DEFERRED_DOOR_ACTION,
+        TIMEOUT_DOOR_COMMAND_WATCH,
+        TIMEOUT_DOOR_COMMAND_VERIFY,
         TIMEOUT_SYNC,
         INTERVAL_STATUS_WATCHDOG,
         TIMEOUT_ENCODER_STOPPED,
@@ -624,6 +643,38 @@ void RATGDOComponent::subscribe_paired_accessories(F&& f)
 {
     this->paired_accessories.subscribe([this, f](uint8_t state) {
         defer(scheduler_ids::DEFER_PAIRED_ACCESSORIES, [f, state] { f(state); });
+    });
+}
+
+template <typename F>
+void RATGDOComponent::subscribe_door_command_recoveries(F&& f)
+{
+    this->door_command_recoveries.subscribe([this, f](uint32_t state) {
+        defer(scheduler_ids::DEFER_DOOR_COMMAND_RECOVERIES, [f, state] { f(state); });
+    });
+}
+
+template <typename F>
+void RATGDOComponent::subscribe_door_command_retry_failures(F&& f)
+{
+    this->door_command_retry_failures.subscribe([this, f](uint32_t state) {
+        defer(scheduler_ids::DEFER_DOOR_COMMAND_RETRY_FAILURES, [f, state] { f(state); });
+    });
+}
+
+template <typename F>
+void RATGDOComponent::subscribe_door_command_unverified(F&& f)
+{
+    this->door_command_unverified.subscribe([this, f](uint32_t state) {
+        defer(scheduler_ids::DEFER_DOOR_COMMAND_UNVERIFIED, [f, state] { f(state); });
+    });
+}
+
+template <typename F>
+void RATGDOComponent::subscribe_door_command_suppressed(F&& f)
+{
+    this->door_command_suppressed.subscribe([this, f](uint32_t state) {
+        defer(scheduler_ids::DEFER_DOOR_COMMAND_SUPPRESSED, [f, state] { f(state); });
     });
 }
 

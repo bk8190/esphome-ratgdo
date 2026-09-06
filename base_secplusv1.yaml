@@ -37,6 +37,36 @@ ratgdo:
             message: "Failed to communicate with garage opener on startup."
             notification_id: "esphome_ratgdo_${id_prefix}_sync_failed"
 
+sensor:
+  - platform: ratgdo
+    id: ${id_prefix}_door_command_recoveries
+    type: door_command_recoveries
+    entity_category: diagnostic
+    name: "Door Command Recoveries"
+    state_class: total_increasing
+    icon: mdi:backup-restore
+  - platform: ratgdo
+    id: ${id_prefix}_door_command_retry_failures
+    type: door_command_retry_failures
+    entity_category: diagnostic
+    name: "Door Command Retry Failures"
+    state_class: total_increasing
+    icon: mdi:alert-circle-outline
+  - platform: ratgdo
+    id: ${id_prefix}_door_command_unverified
+    type: door_command_unverified
+    entity_category: diagnostic
+    name: "Door Command Unverified"
+    state_class: total_increasing
+    icon: mdi:help-circle-outline
+  - platform: ratgdo
+    id: ${id_prefix}_door_command_suppressed
+    type: door_command_suppressed
+    entity_category: diagnostic
+    name: "Door Command Suppressed"
+    state_class: total_increasing
+    icon: mdi:cancel
+
 ota:
   - platform: esphome
     id: ${id_prefix}_ratgdo_ota

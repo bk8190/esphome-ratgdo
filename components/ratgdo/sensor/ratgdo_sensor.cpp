@@ -41,6 +41,30 @@ void RATGDOSensor::setup()
             this->publish_state(value);
         });
         break;
+    case RATGDOSensorType::RATGDO_DOOR_COMMAND_RECOVERIES:
+        this->publish_state(0);
+        this->parent_->subscribe_door_command_recoveries([this](uint32_t value) {
+            this->publish_state(value);
+        });
+        break;
+    case RATGDOSensorType::RATGDO_DOOR_COMMAND_RETRY_FAILURES:
+        this->publish_state(0);
+        this->parent_->subscribe_door_command_retry_failures([this](uint32_t value) {
+            this->publish_state(value);
+        });
+        break;
+    case RATGDOSensorType::RATGDO_DOOR_COMMAND_UNVERIFIED:
+        this->publish_state(0);
+        this->parent_->subscribe_door_command_unverified([this](uint32_t value) {
+            this->publish_state(value);
+        });
+        break;
+    case RATGDOSensorType::RATGDO_DOOR_COMMAND_SUPPRESSED:
+        this->publish_state(0);
+        this->parent_->subscribe_door_command_suppressed([this](uint32_t value) {
+            this->publish_state(value);
+        });
+        break;
     case RATGDOSensorType::RATGDO_DISTANCE:
 #ifdef RATGDO_USE_DISTANCE_SENSOR
         this->distance_sensor_.setI2cDevice(&I2C);
@@ -88,6 +112,18 @@ void RATGDOSensor::dump_config()
         break;
     case RATGDOSensorType::RATGDO_PAIRED_ACCESSORIES:
         ESP_LOGCONFIG(TAG, "  Type: Paired Accessories");
+        break;
+    case RATGDOSensorType::RATGDO_DOOR_COMMAND_RECOVERIES:
+        ESP_LOGCONFIG(TAG, "  Type: Door Command Recoveries");
+        break;
+    case RATGDOSensorType::RATGDO_DOOR_COMMAND_RETRY_FAILURES:
+        ESP_LOGCONFIG(TAG, "  Type: Door Command Retry Failures");
+        break;
+    case RATGDOSensorType::RATGDO_DOOR_COMMAND_UNVERIFIED:
+        ESP_LOGCONFIG(TAG, "  Type: Door Command Unverified");
+        break;
+    case RATGDOSensorType::RATGDO_DOOR_COMMAND_SUPPRESSED:
+        ESP_LOGCONFIG(TAG, "  Type: Door Command Suppressed");
         break;
     case RATGDOSensorType::RATGDO_DISTANCE:
         ESP_LOGCONFIG(TAG, "  Type: Distance");

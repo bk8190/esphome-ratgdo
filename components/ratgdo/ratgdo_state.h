@@ -136,4 +136,11 @@ struct TimeToClose {
     uint16_t seconds;
 };
 
+struct DoorCommandStats {
+    uint32_t retries;
+    uint32_t retry_failures;
+    uint32_t unverified;
+    uint32_t duplicates_suppressed;
+};
+
 } // namespace esphome::ratgdo

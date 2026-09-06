@@ -27,6 +27,10 @@ TYPES = {
     "paired_devices_keypads": RATGDOSensorType.RATGDO_PAIRED_KEYPADS,
     "paired_devices_wall_controls": RATGDOSensorType.RATGDO_PAIRED_WALL_CONTROLS,
     "paired_devices_accessories": RATGDOSensorType.RATGDO_PAIRED_ACCESSORIES,
+    "door_command_recoveries": RATGDOSensorType.RATGDO_DOOR_COMMAND_RECOVERIES,
+    "door_command_retry_failures": RATGDOSensorType.RATGDO_DOOR_COMMAND_RETRY_FAILURES,
+    "door_command_unverified": RATGDOSensorType.RATGDO_DOOR_COMMAND_UNVERIFIED,
+    "door_command_suppressed": RATGDOSensorType.RATGDO_DOOR_COMMAND_SUPPRESSED,
     "distance": RATGDOSensorType.RATGDO_DISTANCE,
     "encoder": RATGDOSensorType.RATGDO_ENCODER,
 }

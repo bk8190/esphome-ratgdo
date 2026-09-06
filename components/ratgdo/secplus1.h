@@ -156,6 +156,18 @@ namespace secplus1 {
         void defer_door_action_(DoorAction action);
         void maybe_run_deferred_door_action_();
         bool door_action_satisfied_(DoorAction action, DoorState state) const;
+        bool arm_door_command_watch_(DoorAction action, DoorState baseline_state);
+        void mark_door_command_transmitted_();
+        void schedule_door_command_watch_timeout_();
+        // Late authoritative re-query after a door command, timed past travel, so
+        // a transient/garbled mid-command read can't stick as the wrong end state.
+        void schedule_post_command_verify_();
+        // Must only be fed states that passed the two-confirmation gate; raw
+        // single reads are noisy enough to fake a "confirmed" verdict.
+        void observe_door_command_status_(DoorState state);
+        void clear_door_command_watch_();
+        void log_door_command_stats_(const char* outcome) const;
+        void publish_door_command_stats_();
 
         // Pointers first (4-byte aligned)
         InternalGPIOPin* tx_pin_;
@@ -173,6 +185,13 @@ namespace secplus1 {
         // suppress active probing while something else is supplying door status.
         uint32_t last_passive_door_status_ { 0 };
         uint32_t pending_door_action_since_ { 0 };
+        uint32_t door_command_sent_at_ { 0 };
+        uint32_t door_command_attempts_ { 0 };
+        uint32_t door_command_misses_ { 0 };
+        uint32_t door_command_retries_ { 0 };
+        uint32_t door_command_retry_failures_ { 0 };
+        uint32_t door_command_unverified_ { 0 };
+        uint32_t door_command_duplicates_suppressed_ { 0 };
 
         // Larger structures
         std::priority_queue<TxCommand, std::vector<TxCommand>, FirstToSend> pending_tx_;
@@ -192,13 +211,17 @@ namespace secplus1 {
         LockState maybe_lock_state { LockState::UNKNOWN };
         DoorState maybe_door_state { DoorState::UNKNOWN };
         DoorAction pending_door_action_ { DoorAction::UNKNOWN };
+        DoorAction watched_door_action_ { DoorAction::UNKNOWN };
+        DoorState watched_door_baseline_ { DoorState::UNKNOWN };
         WallPanelEmulationState wall_panel_emulation_state_ { WallPanelEmulationState::WAITING };
         struct {
             uint8_t door_moving : 1;
             uint8_t wall_panel_starting : 1;
             uint8_t is_0x37_panel : 1;
             uint8_t rx_reading_msg : 1;
-            uint8_t reserved : 4; // Reserved for future use
+            uint8_t door_command_retried : 1;
+            uint8_t door_command_baseline_reads : 2;
+            uint8_t reserved : 1; // Reserved for future use
         } flags_ { 0 };
     };
 

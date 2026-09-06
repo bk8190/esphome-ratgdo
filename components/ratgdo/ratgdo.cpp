@@ -432,6 +432,14 @@ void RATGDOComponent::received(const TimeToClose ttc)
     ESP_LOGD(TAG, "Time to close (TTC): %ds", ttc.seconds);
 }
 
+void RATGDOComponent::received(const DoorCommandStats stats)
+{
+    this->door_command_recoveries = stats.retries;
+    this->door_command_retry_failures = stats.retry_failures;
+    this->door_command_unverified = stats.unverified;
+    this->door_command_suppressed = stats.duplicates_suppressed;
+}
+
 void RATGDOComponent::received(const BatteryState battery_state)
 {
     ESP_LOGD(TAG, "Battery state=%s",
