@@ -15,7 +15,9 @@ namespace secplus1 {
 
     using namespace scheduler_ids;
     static const char* const TAG = "ratgdo_secplus1";
-    static constexpr uint32_t DOOR_STATE_CALLBACK_TIMEOUT = 2000;
+    // Basic panels need two actively requested replies to confirm a transition.
+    static constexpr uint32_t DOOR_STATE_CALLBACK_TIMEOUT = 12000;
+    static constexpr uint32_t DOOR_STATUS_FAST_INTERVAL = 2500;
     static constexpr uint32_t DOOR_ACTION_DEFER_TIMEOUT = 22000;
     static constexpr uint32_t DOOR_ACTION_POST_TOGGLE_QUERY_DELAY = 1200;
     // Pre-toggle bus warm-up: wake the opener's receiver with a short
@@ -25,8 +27,8 @@ namespace secplus1 {
     static constexpr uint32_t DOOR_PRESS_WARMUP_INTERVAL = 200; // ms between warm-up queries and before the press
     static constexpr uint8_t DOOR_COMMAND_BASELINE_CONFIRMATIONS = 2;
     static constexpr uint32_t DOOR_COMMAND_RETRY_MIN_DELAY = 3000;
-    // Watch verdicts consume only two-read-confirmed states, and one noise read
-    // resets the confirmation gate (costing ~2 extra reads at the 2.5s probe
+    // Watch verdicts consume only two-read-confirmed states. Noise that decodes
+    // as a different valid state resets the gate (costing extra reads at the 2.5s probe
     // cadence), so the window must fit 2 confirmed baseline reads plus one
     // noise-flip recovery after the ~0.6s warm-up burst.
     static constexpr uint32_t DOOR_COMMAND_WATCH_TIMEOUT = 12000;
@@ -87,6 +89,9 @@ namespace secplus1 {
         this->wall_panel_emulation_state_ = WallPanelEmulationState::WAITING;
         this->wall_panel_emulation_start_ = millis();
         this->flags_.wall_panel_starting = false;
+        this->cancel_pending_door_presses_();
+        this->on_door_state_.clear();
+        this->cancel_door_state_expiry();
         this->clear_deferred_door_action_();
         this->clear_door_command_watch_();
         this->door_state = DoorState::UNKNOWN;
@@ -106,7 +111,12 @@ namespace secplus1 {
         // position. Non-0x37 wall panels never poll door status, so passively
         // waiting can leave door_state UNKNOWN forever after a reboot. Short
         // delay lets boot-time bus traffic settle before we transmit.
-        this->scheduler_->set_timeout(this->ratgdo_, TIMEOUT_DOOR_PROBE, 5000, [this] {
+        this->schedule_door_status_probe_(5000);
+    }
+
+    void Secplus1::schedule_door_status_probe_(uint32_t delay)
+    {
+        this->scheduler_->set_timeout(this->ratgdo_, TIMEOUT_DOOR_PROBE, delay, [this] {
             this->door_status_probe_();
         });
     }
@@ -143,11 +153,11 @@ namespace secplus1 {
         // probing can resume if it disappears. Self-sustaining single timer
         // (same scheduler key replaces the prior one).
         const bool correction_pending = this->maybe_door_state != this->door_state;
-        uint32_t next_ms = (this->door_state == DoorState::UNKNOWN || this->flags_.door_moving || correction_pending)
-            ? 2500 : 10000;
-        this->scheduler_->set_timeout(this->ratgdo_, TIMEOUT_DOOR_PROBE, next_ms, [this] {
-            this->door_status_probe_();
-        });
+        const bool watching_command = this->watched_door_action_ != DoorAction::UNKNOWN;
+        uint32_t next_ms = (this->door_state == DoorState::UNKNOWN || this->flags_.door_moving || correction_pending || watching_command)
+            ? DOOR_STATUS_FAST_INTERVAL
+            : 10000;
+        this->schedule_door_status_probe_(next_ms);
     }
 
     void Secplus1::wall_panel_emulation(size_t index)
@@ -233,15 +243,16 @@ namespace secplus1 {
 
     void Secplus1::set_door_state_expiry()
     {
-        this->scheduler_->set_timeout(this->ratgdo_, TIMEOUT_DOOR_STATE_EXPIRY, DOOR_STATE_CALLBACK_TIMEOUT, [this]() {
+        this->scheduler_->set_timeout(this->ratgdo_, TIMEOUT_SECPLUS1_DOOR_STATE_EXPIRY, DOOR_STATE_CALLBACK_TIMEOUT, [this]() {
             ESP_LOGW(TAG, "Door state callback expired, clearing");
             this->on_door_state_.clear();
+            this->cancel_pending_door_presses_();
         });
     }
 
     void Secplus1::cancel_door_state_expiry()
     {
-        this->scheduler_->cancel_timeout(this->ratgdo_, TIMEOUT_DOOR_STATE_EXPIRY);
+        this->scheduler_->cancel_timeout(this->ratgdo_, TIMEOUT_SECPLUS1_DOOR_STATE_EXPIRY);
     }
 
     void Secplus1::clear_deferred_door_action_()
@@ -321,6 +332,7 @@ namespace secplus1 {
         // duplicate-suppressing every later command in the same direction.
         // mark_door_command_transmitted_ re-schedules from actual transmit.
         this->schedule_door_command_watch_timeout_();
+        this->schedule_door_status_probe_(DOOR_STATUS_FAST_INTERVAL);
         return true;
     }
 
@@ -348,6 +360,7 @@ namespace secplus1 {
             }
             this->door_command_unverified_++;
             this->log_door_command_stats_("inconclusive");
+            this->cancel_pending_door_presses_();
             this->clear_door_command_watch_();
             this->publish_door_command_stats_();
         });
@@ -362,18 +375,26 @@ namespace secplus1 {
         this->door_command_sent_at_ = millis();
         this->flags_.door_command_baseline_reads = 0;
         this->schedule_door_command_watch_timeout_();
+        this->schedule_door_status_probe_(DOOR_STATUS_FAST_INTERVAL);
     }
 
     void Secplus1::observe_door_command_status_(DoorState state)
     {
-        if (this->watched_door_action_ == DoorAction::UNKNOWN || this->door_command_sent_at_ == 0 || state == DoorState::UNKNOWN) {
+        if (this->watched_door_action_ == DoorAction::UNKNOWN || state == DoorState::UNKNOWN) {
             return;
         }
 
         if (state != this->watched_door_baseline_) {
             this->log_door_command_stats_(this->flags_.door_command_retried ? "recovered" : "confirmed");
+            // A manual command or delayed actuation can start motion during
+            // warm-up. Cancel the queued press before it can stop that motion.
+            this->cancel_pending_door_presses_();
             this->clear_door_command_watch_();
             return;
+        }
+
+        if (this->door_command_sent_at_ == 0) {
+            return; // Warm-up baseline replies cannot establish a missed press.
         }
 
         if (this->flags_.door_command_baseline_reads < DOOR_COMMAND_BASELINE_CONFIRMATIONS) {
@@ -480,12 +501,27 @@ namespace secplus1 {
             return;
         }
 
+        if (action == this->watched_door_action_) {
+            this->door_command_duplicates_suppressed_++;
+            this->log_door_command_stats_("duplicate suppressed");
+            this->publish_door_command_stats_();
+            return;
+        }
+
+        // A new intent supersedes an earlier queued press, retry, deferred
+        // action, or direction sequence, even when already satisfied by state.
+        // Preserve release bytes: a press already on the bus must be released.
+        this->cancel_pending_door_presses_();
+        this->clear_door_command_watch_();
+        this->clear_deferred_door_action_();
+        this->on_door_state_.clear();
+        this->cancel_door_state_expiry();
+
         if ((action == DoorAction::OPEN || action == DoorAction::CLOSE) && this->door_state == DoorState::UNKNOWN) {
             this->defer_door_action_(action);
             return;
         }
 
-        const uint32_t double_toggle_delay = 1000;
         if (action == DoorAction::TOGGLE) {
             this->toggle_door();
         } else if (action == DoorAction::OPEN) {
@@ -572,7 +608,7 @@ namespace secplus1 {
         uint32_t press_delay = 0;
         if (this->door_state != DoorState::OPENING && this->door_state != DoorState::CLOSING) {
             for (uint8_t i = 0; i < DOOR_PRESS_WARMUP_QUERIES; i++) {
-                this->enqueue_transmit(CommandType::QUERY_DOOR_STATUS, now + i * DOOR_PRESS_WARMUP_INTERVAL);
+                this->enqueue_transmit(CommandType::QUERY_DOOR_STATUS, now + i * DOOR_PRESS_WARMUP_INTERVAL, true);
             }
             press_delay = DOOR_PRESS_WARMUP_QUERIES * DOOR_PRESS_WARMUP_INTERVAL;
         }
@@ -734,26 +770,31 @@ namespace secplus1 {
                 return;
             }
 
-            if (this->maybe_door_state != door_state) {
-                this->on_door_state_.trigger(door_state);
-            }
-
             if (!this->flags_.is_0x37_panel && door_state != this->maybe_door_state) {
+                if (this->maybe_door_state == this->door_state) {
+                    // The background timer was chosen before this response.
+                    // Pull the next probe forward when a correction starts.
+                    this->schedule_door_status_probe_(DOOR_STATUS_FAST_INTERVAL);
+                }
                 this->maybe_door_state = door_state;
                 ESP_LOG1(TAG, "Door maybe %s, waiting for 2nd status message to confirm", LOG_STR_ARG(DoorState_to_string(door_state)));
             } else {
+                const bool state_changed = this->door_state != door_state;
                 this->maybe_door_state = door_state;
                 this->door_state = door_state;
-                if (this->door_state == DoorState::STOPPED || this->door_state == DoorState::OPEN || this->door_state == DoorState::CLOSED) {
-                    this->flags_.door_moving = false;
-                }
-                this->ratgdo_->received(door_state);
+                this->flags_.door_moving = door_state == DoorState::OPENING || door_state == DoorState::CLOSING;
                 // The command watch only trusts state that survived the
                 // two-confirmation gate above: a single garbled read must not
                 // clear the watch as "confirmed" (door moved) any more than it
                 // may commit state to HA. Runs before the deferred-action
                 // dispatch so the old watch settles before a new one can arm.
                 this->observe_door_command_status_(door_state);
+                if (state_changed) {
+                    // Direction-changing presses require confirmed movement,
+                    // and must dispatch using the newly committed state.
+                    this->on_door_state_.trigger(door_state);
+                }
+                this->ratgdo_->received(door_state);
                 this->maybe_run_deferred_door_action_();
             }
         } else if (cmd.req == CommandType::QUERY_DOOR_STATUS_0x37) {
@@ -810,6 +851,17 @@ namespace secplus1 {
     {
         auto cmd = this->pop_pending_tx();
         if (cmd) {
+            if (cmd.value() == CommandType::TOGGLE_DOOR_PRESS && this->flags_.door_command_retried
+                && (this->door_state != this->watched_door_baseline_ || this->maybe_door_state != this->watched_door_baseline_)) {
+                // Even an unconfirmed change during warm-up makes a retry
+                // unsafe. Do not send it and do not claim successful recovery.
+                this->door_command_unverified_++;
+                this->log_door_command_stats_("retry cancelled before transmit");
+                this->cancel_pending_door_presses_();
+                this->clear_door_command_watch_();
+                this->publish_door_command_stats_();
+                return true;
+            }
             this->enqueue_command_pair(cmd.value());
             this->transmit_byte(static_cast<uint32_t>(cmd.value()));
         }
@@ -820,6 +872,7 @@ namespace secplus1 {
     {
         auto now = millis();
         if (cmd == CommandType::TOGGLE_DOOR_PRESS) {
+            this->flags_.door_moving = true;
             this->mark_door_command_transmitted_();
             this->enqueue_transmit(CommandType::TOGGLE_DOOR_RELEASE, now + 500);
             this->enqueue_transmit(CommandType::QUERY_DOOR_STATUS, now + DOOR_ACTION_POST_TOGGLE_QUERY_DELAY);
@@ -832,12 +885,25 @@ namespace secplus1 {
         };
     }
 
-    void Secplus1::enqueue_transmit(CommandType cmd, uint32_t time)
+    void Secplus1::enqueue_transmit(CommandType cmd, uint32_t time, bool door_warmup)
     {
         if (time == 0) {
             time = millis();
         }
-        this->pending_tx_.push(TxCommand { cmd, time });
+        this->pending_tx_.push(TxCommand { cmd, door_warmup, time });
+    }
+
+    void Secplus1::cancel_pending_door_presses_()
+    {
+        decltype(this->pending_tx_) remaining;
+        while (!this->pending_tx_.empty()) {
+            auto cmd = this->pending_tx_.top();
+            this->pending_tx_.pop();
+            if (cmd.request != CommandType::TOGGLE_DOOR_PRESS && !cmd.door_warmup) {
+                remaining.push(cmd);
+            }
+        }
+        this->pending_tx_ = std::move(remaining);
     }
 
     optional<CommandType> Secplus1::pending_tx()

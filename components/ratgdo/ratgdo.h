@@ -541,6 +541,7 @@ namespace scheduler_ids {
         // protocol is compiled at a time (#ifdef PROTOCOL_SECPLUSV1) and
         // both use ratgdo_ as the scheduler owner.
         TIMEOUT_DOOR_STATE_EXPIRY,
+        TIMEOUT_SECPLUS1_DOOR_STATE_EXPIRY,
         TIMEOUT_PRESENCE_DETECT_WINDOW,
         TIMEOUT_CLEAR_PRESENCE,
         TIMEOUT_WALL_PANEL_EMULATION,

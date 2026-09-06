@@ -75,6 +75,8 @@ namespace secplus1 {
 
     struct TxCommand {
         CommandType request;
+        // Cancel these queries together with their still-queued door press.
+        bool door_warmup { false };
         uint32_t time;
     };
 
@@ -133,6 +135,7 @@ namespace secplus1 {
         // periodically inject QUERY_DOOR_STATUS instead of only waiting to
         // overhear a passive poll that may never come.
         void door_status_probe_();
+        void schedule_door_status_probe_(uint32_t delay);
 
         optional<RxCommand> read_command();
         void handle_command(const RxCommand& cmd);
@@ -141,7 +144,8 @@ namespace secplus1 {
         void print_tx_packet(const TxPacket& packet) const;
         optional<RxCommand> decode_packet(const RxPacket& packet) const;
 
-        void enqueue_transmit(CommandType cmd, uint32_t time = 0);
+        void enqueue_transmit(CommandType cmd, uint32_t time = 0, bool door_warmup = false);
+        void cancel_pending_door_presses_();
         optional<CommandType> pending_tx();
         optional<CommandType> pop_pending_tx();
         bool do_transmit_if_pending();

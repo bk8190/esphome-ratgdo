@@ -37,11 +37,17 @@ using namespace protocol;
 
 static const char* const TAG = "ratgdo";
 static constexpr int SYNC_DELAY = 1000;
+#ifdef PROTOCOL_SECPLUSV1
+// Basic panels require two active queries, normally 1.2s and 3.7s after
+// transmission, with additional margin for warm-up and a noisy response.
+static constexpr uint32_t DOOR_STATE_CALLBACK_TIMEOUT = 12000;
+#else
 // Door state updates arrive over UART every ~200-400ms during movement.
 // 2 seconds gives ample margin for slow openers while still expiring
 // stale callbacks before a user could reasonably trigger an unrelated
 // door state change.
 static constexpr uint32_t DOOR_STATE_CALLBACK_TIMEOUT = 2000;
+#endif
 
 using namespace scheduler_ids;
 
@@ -734,9 +740,11 @@ void RATGDOComponent::cancel_door_state_expiry()
 
 void RATGDOComponent::door_open()
 {
+#ifndef PROTOCOL_SECPLUSV1
     if (*this->door_state == DoorState::OPENING) {
         return; // gets ignored by opener
     }
+#endif
 
 #ifdef RATGDO_USE_ENCODER
     // Record intended direction so on_encoder_update can detect a wrong-way GDO response.
@@ -753,8 +761,7 @@ void RATGDOComponent::door_open()
                     && *this->door_state != DoorState::STOPPED
                     // If the protocol confirmed CLOSED, the door did not open silently;
                     // don't override with a spurious OPEN assumption.
-                    && *this->door_state != DoorState::CLOSED
-                ) {
+                    && *this->door_state != DoorState::CLOSED) {
                     this->received(DoorState::OPEN); // probably missed a status message,
                                                      // assume it's open
                     this->query_status(); // query in case we're wrong and it's stopped
@@ -765,6 +772,11 @@ void RATGDOComponent::door_open()
 
 void RATGDOComponent::door_close()
 {
+#ifdef PROTOCOL_SECPLUSV1
+    // Sec+1 owns its single-button direction sequence. Forward even a
+    // satisfied request so it can cancel an older queued OPEN or retry.
+    this->door_action(DoorAction::CLOSE);
+#else
     if (*this->door_state == DoorState::CLOSING) {
         // Door is already heading in the right direction. If the user explicitly
         // requested CLOSE (e.g., after a partial move_to_position), remember the intent
@@ -810,6 +822,7 @@ void RATGDOComponent::door_close()
         ESP_LOGD(TAG, "No obstruction sensors detected. Close using TOGGLE.");
         this->door_action(DoorAction::TOGGLE);
     }
+#endif
 
     if (*this->closing_duration > 0) {
         // query state in case we don't get a status message
@@ -829,10 +842,12 @@ void RATGDOComponent::door_close()
 
 void RATGDOComponent::door_stop()
 {
+#ifndef PROTOCOL_SECPLUSV1
     if (*this->door_state != DoorState::OPENING && *this->door_state != DoorState::CLOSING) {
         ESP_LOGW(TAG, "The door is not moving.");
         return;
     }
+#endif
     this->door_action(DoorAction::STOP);
 }
 
@@ -840,6 +855,11 @@ void RATGDOComponent::door_toggle() { this->door_action(DoorAction::TOGGLE); }
 
 void RATGDOComponent::door_action(DoorAction action)
 {
+#ifdef PROTOCOL_SECPLUSV1
+    // Supersede component-level continuations as well as protocol work.
+    this->on_door_state_.clear();
+    this->cancel_door_state_expiry();
+#endif
 #ifdef RATGDO_USE_CLOSING_DELAY
     if (*this->closing_delay > 0 && (action == DoorAction::CLOSE || (action == DoorAction::TOGGLE && *this->door_state != DoorState::CLOSED))) {
         this->door_action_delayed = DoorActionDelayed::YES;
