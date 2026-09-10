@@ -118,6 +118,8 @@ namespace protocol {
         virtual void light_action(LightAction action);
         virtual void lock_action(LockAction action);
         virtual void door_action(DoorAction action);
+        // Cancel pending door work without transmitting a new control command.
+        virtual void cancel_door_action() { }
 
         virtual protocol::Result call(protocol::Args args);
     };

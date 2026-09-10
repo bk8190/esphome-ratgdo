@@ -209,9 +209,12 @@ void RATGDOComponent::on_shutdown()
     }
 }
 
-void RATGDOComponent::received(const DoorState door_state)
+void RATGDOComponent::received(const DoorState door_state, uint32_t observed_at)
 {
     auto prev_door_state = *this->door_state;
+    if (observed_at == 0) {
+        observed_at = millis();
+    }
 
     if (prev_door_state == door_state) {
         return;
@@ -249,15 +252,15 @@ void RATGDOComponent::received(const DoorState door_state)
     if (door_state == DoorState::OPENING) {
         // door started opening
         if (prev_door_state == DoorState::CLOSING) {
-            this->door_position_update();
+            this->door_position_update(observed_at);
             this->cancel_position_sync_callbacks();
             this->door_move_delta = DOOR_DELTA_UNKNOWN;
         }
-        this->door_start_moving = millis();
+        this->door_start_moving = observed_at;
         this->door_start_position = *this->door_position;
-        if (this->door_move_delta == DOOR_DELTA_UNKNOWN) {
-            this->door_move_delta = 1.0 - this->door_start_position;
-        }
+        // Integrate the reported direction, independent of a slider target or
+        // estimated endpoint. OPENING at position 1 must not select closing.
+        this->door_move_delta = 1.0;
         if (*this->opening_duration != 0) {
 #ifdef RATGDO_USE_ENCODER
             if (encoder_sensor_ == nullptr)
@@ -267,15 +270,13 @@ void RATGDOComponent::received(const DoorState door_state)
     } else if (door_state == DoorState::CLOSING) {
         // door started closing
         if (prev_door_state == DoorState::OPENING) {
-            this->door_position_update();
+            this->door_position_update(observed_at);
             this->cancel_position_sync_callbacks();
             this->door_move_delta = DOOR_DELTA_UNKNOWN;
         }
-        this->door_start_moving = millis();
+        this->door_start_moving = observed_at;
         this->door_start_position = *this->door_position;
-        if (this->door_move_delta == DOOR_DELTA_UNKNOWN) {
-            this->door_move_delta = 0.0 - this->door_start_position;
-        }
+        this->door_move_delta = -1.0;
         if (*this->closing_duration != 0) {
 #ifdef RATGDO_USE_ENCODER
             if (encoder_sensor_ == nullptr)
@@ -286,7 +287,7 @@ void RATGDOComponent::received(const DoorState door_state)
 #ifdef RATGDO_USE_ENCODER
         if (encoder_sensor_ == nullptr)
 #endif
-            this->door_position_update();
+            this->door_position_update(observed_at);
         if (*this->door_position == DOOR_POSITION_UNKNOWN) {
             this->door_position = 0.5; // best guess
         }
@@ -318,6 +319,9 @@ void RATGDOComponent::received(const DoorState door_state)
     }
 
     this->door_state = door_state;
+#ifdef PROTOCOL_SECPLUSV1
+    this->update_position_target_(door_state);
+#endif
     this->on_door_state_.trigger(door_state);
 }
 
@@ -475,12 +479,12 @@ void RATGDOComponent::schedule_door_position_sync(float update_period)
         });
 }
 
-void RATGDOComponent::door_position_update()
+void RATGDOComponent::door_position_update(uint32_t observed_at)
 {
     if (this->door_start_moving == 0 || this->door_start_position == DOOR_POSITION_UNKNOWN || this->door_move_delta == DOOR_DELTA_UNKNOWN) {
         return;
     }
-    auto now = millis();
+    auto now = observed_at == 0 ? millis() : observed_at;
     auto duration = this->door_move_delta > 0 ? *this->opening_duration
                                               : -*this->closing_duration;
     if (duration == 0) {
@@ -757,6 +761,9 @@ void RATGDOComponent::door_open()
         this->set_timeout(
             TIMEOUT_DOOR_QUERY_STATE, (*this->opening_duration + 2) * 1000,
             [this]() {
+#ifdef PROTOCOL_SECPLUSV1
+                this->query_status();
+#else
                 if (*this->door_state != DoorState::OPEN
                     && *this->door_state != DoorState::STOPPED
                     // If the protocol confirmed CLOSED, the door did not open silently;
@@ -766,6 +773,7 @@ void RATGDOComponent::door_open()
                                                      // assume it's open
                     this->query_status(); // query in case we're wrong and it's stopped
                 }
+#endif
             });
     }
 }
@@ -829,6 +837,9 @@ void RATGDOComponent::door_close()
         this->set_timeout(
             TIMEOUT_DOOR_QUERY_STATE, (*this->closing_duration + 2) * 1000,
             [this]() {
+#ifdef PROTOCOL_SECPLUSV1
+                this->query_status();
+#else
                 if (*this->door_state != DoorState::CLOSED
                     && *this->door_state != DoorState::STOPPED
                     && *this->door_state != DoorState::OPEN) {
@@ -836,6 +847,7 @@ void RATGDOComponent::door_close()
                                                        // message, assume it's closed
                     this->query_status(); // query in case we're wrong and it's stopped
                 }
+#endif
             });
     }
 }
@@ -856,6 +868,8 @@ void RATGDOComponent::door_toggle() { this->door_action(DoorAction::TOGGLE); }
 void RATGDOComponent::door_action(DoorAction action)
 {
 #ifdef PROTOCOL_SECPLUSV1
+    this->cancel_position_target_();
+    this->cancel_timeout(TIMEOUT_DOOR_QUERY_STATE);
     // Supersede component-level continuations as well as protocol work.
     this->on_door_state_.clear();
     this->cancel_door_state_expiry();
@@ -877,6 +891,20 @@ void RATGDOComponent::door_action(DoorAction action)
 
 void RATGDOComponent::door_move_to_position(float position)
 {
+#ifdef PROTOCOL_SECPLUSV1
+    // Supersede even an already-satisfied target. A STOP here removes queued
+    // starts and old direction continuations without toggling a stationary door.
+    this->cancel_position_target_();
+    if (!std::isfinite(position) || position <= 0.0f || position >= 1.0f
+        || *this->door_state == DoorState::UNKNOWN
+        || !std::isfinite(*this->door_position) || *this->door_position < 0.0f || *this->door_position > 1.0f
+        || (*this->door_state == DoorState::STOPPED && (*this->door_position == 0.0f || *this->door_position == 1.0f))) {
+        ESP_LOGW(TAG, "Partial position requires a valid estimate; query or reach an end stop first");
+        this->door_action(DoorAction::STOP);
+        this->query_status();
+        return;
+    }
+#endif
     if (*this->door_state == DoorState::OPENING || *this->door_state == DoorState::CLOSING) {
         this->door_action(DoorAction::STOP);
         this->on_door_state([this, position](DoorState s) {
@@ -889,18 +917,23 @@ void RATGDOComponent::door_move_to_position(float position)
 
     auto delta = position - *this->door_position;
     if (delta == 0) {
+#ifdef PROTOCOL_SECPLUSV1
+        this->door_action(DoorAction::STOP);
+#endif
         ESP_LOGD(TAG, "Door is already at position %.2f", position);
         return;
     }
 
     auto duration = delta > 0 ? *this->opening_duration : -*this->closing_duration;
     if (duration == 0) {
+#ifdef PROTOCOL_SECPLUSV1
+        this->door_action(DoorAction::STOP);
+#endif
         ESP_LOGW(TAG, "I don't know duration, ignoring move to position");
         return;
     }
 
     auto operation_time = 1000 * duration * delta;
-    this->door_move_delta = delta;
     ESP_LOGD(TAG, "Moving to position %.2f in %.1fs", position,
         operation_time / 1000.0);
 
@@ -911,6 +944,15 @@ void RATGDOComponent::door_move_to_position(float position)
     enc_intended_dir_ = (delta > 0) ? 1 : -1;
 #endif
     this->door_action(delta > 0 ? DoorAction::OPEN : DoorAction::CLOSE);
+#ifdef PROTOCOL_SECPLUSV1
+    this->position_target_ = position;
+    this->position_target_direction_ = delta > 0 ? DoorState::OPENING : DoorState::CLOSING;
+    // Includes a possible deferred start/retry and a STOPPED direction sequence.
+    this->set_timeout(TIMEOUT_POSITION_CONFIRM, 45000, [this] {
+        ESP_LOGW(TAG, "Partial-position movement was not confirmed; cancelling target");
+        this->door_action(DoorAction::STOP);
+    });
+#else
     this->set_timeout(TIMEOUT_MOVE_TO_POSITION, operation_time,
         [this] {
 #ifdef RATGDO_USE_ENCODER
@@ -918,7 +960,61 @@ void RATGDOComponent::door_move_to_position(float position)
 #endif
             this->door_action(DoorAction::STOP);
         });
+#endif
 }
+
+#ifdef PROTOCOL_SECPLUSV1
+void RATGDOComponent::cancel_position_target_()
+{
+    this->position_target_.reset();
+    this->position_target_direction_ = DoorState::UNKNOWN;
+    this->position_target_tracking_ = false;
+    this->cancel_timeout(TIMEOUT_MOVE_TO_POSITION);
+    this->cancel_timeout(TIMEOUT_POSITION_CONFIRM);
+}
+
+void RATGDOComponent::update_position_target_(DoorState state)
+{
+    if (!this->position_target_.has_value()) {
+        return;
+    }
+    if (this->position_target_tracking_) {
+        if (state != this->position_target_direction_) {
+            // A stop or reversal ends this target. Never resume it later.
+            this->cancel_position_target_();
+            this->protocol_->cancel_door_action();
+        }
+        return;
+    }
+    if (state == DoorState::OPEN || state == DoorState::CLOSED || state == DoorState::UNKNOWN) {
+        this->cancel_position_target_();
+        this->protocol_->cancel_door_action();
+        return;
+    }
+    if (state != this->position_target_direction_) {
+        return; // The protocol may still be doing its STOPPED direction sequence.
+    }
+
+    this->position_target_tracking_ = true;
+    this->cancel_timeout(TIMEOUT_POSITION_CONFIRM);
+    // received() backdates the movement start to the first matching reply.
+    // Integrate that elapsed travel before choosing the remaining STOP delay.
+    this->door_position_update();
+    const auto delta = *this->position_target_ - *this->door_position;
+    const bool opening = state == DoorState::OPENING;
+    const auto remaining = opening ? delta : -delta;
+    const auto duration = opening ? *this->opening_duration : *this->closing_duration;
+    const uint32_t delay = remaining > 0 && duration > 0 ? remaining * duration * 1000 : 0;
+    ESP_LOGD(TAG, "Partial-position direction confirmed; stopping in %lums", static_cast<unsigned long>(delay));
+    this->set_timeout(TIMEOUT_MOVE_TO_POSITION, delay, [this] {
+        if (this->position_target_.has_value() && *this->door_state == this->position_target_direction_) {
+            this->door_action(DoorAction::STOP);
+        } else {
+            this->cancel_position_target_();
+        }
+    });
+}
+#endif
 
 void RATGDOComponent::cancel_position_sync_callbacks()
 {

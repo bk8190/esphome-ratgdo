@@ -101,6 +101,7 @@ namespace secplus1 {
         void light_action(LightAction action);
         void lock_action(LockAction action);
         void door_action(DoorAction action);
+        void cancel_door_action() override;
         void set_door_state_expiry();
         void cancel_door_state_expiry();
 
@@ -214,6 +215,7 @@ namespace secplus1 {
         LightState maybe_light_state { LightState::UNKNOWN };
         LockState maybe_lock_state { LockState::UNKNOWN };
         DoorState maybe_door_state { DoorState::UNKNOWN };
+        uint32_t maybe_door_state_since_ { 0 };
         DoorAction pending_door_action_ { DoorAction::UNKNOWN };
         DoorAction watched_door_action_ { DoorAction::UNKNOWN };
         DoorState watched_door_baseline_ { DoorState::UNKNOWN };

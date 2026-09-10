@@ -4,11 +4,18 @@
 #include "secplus1.h"
 #include "ratgdo.h"
 
+#include <cinttypes>
+
 #include "esphome/core/gpio.h"
 #include "esphome/core/hal.h"
 #include "esphome/core/helpers.h"
 #include "esphome/core/log.h"
 #include "esphome/core/scheduler.h"
+
+// Opt-in packet/state/queue tracing; disabled builds omit its argument evaluation.
+#ifndef RATGDO_SECPLUS1_DIAGNOSTICS
+#define RATGDO_SECPLUS1_DIAGNOSTICS 0
+#endif
 
 namespace esphome::ratgdo {
 namespace secplus1 {
@@ -77,6 +84,11 @@ namespace secplus1 {
     void Secplus1::dump_config()
     {
         ESP_LOGCONFIG(TAG, "  Protocol: SEC+ v1");
+#if RATGDO_SECPLUS1_DIAGNOSTICS
+        ESP_LOGCONFIG(TAG, "  Packet diagnostics: enabled");
+#else
+        ESP_LOGCONFIG(TAG, "  Packet diagnostics: disabled");
+#endif
     }
 
     void Secplus1::on_shutdown()
@@ -95,6 +107,9 @@ namespace secplus1 {
         this->clear_deferred_door_action_();
         this->clear_door_command_watch_();
         this->door_state = DoorState::UNKNOWN;
+        this->ratgdo_->cancel_position_target_();
+        this->maybe_door_state = DoorState::UNKNOWN;
+        this->maybe_door_state_since_ = 0;
         this->light_state = LightState::UNKNOWN;
         this->scheduler_->cancel_timeout(this->ratgdo_, TIMEOUT_WALL_PANEL_EMULATION);
         this->scheduler_->cancel_timeout(this->ratgdo_, TIMEOUT_DOOR_COMMAND_VERIFY);
@@ -276,7 +291,7 @@ namespace secplus1 {
     void Secplus1::log_door_command_stats_(const char* outcome) const
     {
         ESP_LOGI(TAG,
-            "Door command recovery %s: attempts=%u misses=%u retries=%u retry_failures=%u unverified=%u duplicates_suppressed=%u",
+            "Door command recovery %s: attempts=%" PRIu32 " misses=%" PRIu32 " retries=%" PRIu32 " retry_failures=%" PRIu32 " unverified=%" PRIu32 " duplicates_suppressed=%" PRIu32,
             outcome,
             this->door_command_attempts_,
             this->door_command_misses_,
@@ -494,9 +509,25 @@ namespace secplus1 {
         this->door_action(action);
     }
 
+    void Secplus1::cancel_door_action()
+    {
+        this->cancel_pending_door_presses_();
+        this->clear_door_command_watch_();
+        this->clear_deferred_door_action_();
+        this->on_door_state_.clear();
+        this->cancel_door_state_expiry();
+    }
+
     void Secplus1::door_action(DoorAction action)
     {
+#if RATGDO_SECPLUS1_DIAGNOSTICS
+        ESP_LOGD(TAG, "[%" PRIu32 "] Door request=%s held=%s candidate=%s watch=%s queued=%u",
+            millis(), LOG_STR_ARG(DoorAction_to_string(action)), LOG_STR_ARG(DoorState_to_string(this->door_state)),
+            LOG_STR_ARG(DoorState_to_string(this->maybe_door_state)), LOG_STR_ARG(DoorAction_to_string(this->watched_door_action_)),
+            static_cast<unsigned>(this->pending_tx_.size()));
+#else
         ESP_LOG1(TAG, "Door action: %s, door state: %s", LOG_STR_ARG(DoorAction_to_string(action)), LOG_STR_ARG(DoorState_to_string(this->door_state)));
+#endif
         if (action == DoorAction::UNKNOWN) {
             return;
         }
@@ -511,11 +542,7 @@ namespace secplus1 {
         // A new intent supersedes an earlier queued press, retry, deferred
         // action, or direction sequence, even when already satisfied by state.
         // Preserve release bytes: a press already on the bus must be released.
-        this->cancel_pending_door_presses_();
-        this->clear_door_command_watch_();
-        this->clear_deferred_door_action_();
-        this->on_door_state_.clear();
-        this->cancel_door_state_expiry();
+        this->cancel_door_action();
 
         if ((action == DoorAction::OPEN || action == DoorAction::CLOSE) && this->door_state == DoorState::UNKNOWN) {
             this->defer_door_action_(action);
@@ -562,6 +589,9 @@ namespace secplus1 {
                     }
                 });
             } else if (this->door_state == DoorState::STOPPED) {
+#if RATGDO_SECPLUS1_DIAGNOSTICS
+                ESP_LOGD(TAG, "[%" PRIu32 "] CLOSE from STOPPED: single press; recovery watch not armed", millis());
+#endif
                 this->toggle_door();
             }
         } else if (action == DoorAction::STOP) {
@@ -640,14 +670,14 @@ namespace secplus1 {
 
                 if (ser_byte < 0x30 || ser_byte > 0x3A) {
                     char hex[format_hex_pretty_size(1)];
-                    ESP_LOG2(TAG, "[%d] Ignoring byte [%s], baud: %d", millis(), format_hex_pretty_to(hex, &ser_byte, 1), this->uart_.baudRate());
+                    ESP_LOG2(TAG, "[%" PRIu32 "] Ignoring byte [%s], baud: %d", millis(), format_hex_pretty_to(hex, &ser_byte, 1), this->uart_.baudRate());
                     this->rx_byte_count_ = 0;
                     continue;
                 }
                 this->rx_packet_[this->rx_byte_count_++] = ser_byte;
                 {
                     char hex[format_hex_pretty_size(1)];
-                    ESP_LOG2(TAG, "[%d] Received byte: [%s]", millis(), format_hex_pretty_to(hex, &ser_byte, 1));
+                    ESP_LOG2(TAG, "[%" PRIu32 "] Received byte: [%s]", millis(), format_hex_pretty_to(hex, &ser_byte, 1));
                 }
                 this->flags_.rx_reading_msg = true;
 
@@ -657,7 +687,11 @@ namespace secplus1 {
                     this->rx_byte_count_ = 0;
                     {
                         char hex[format_hex_pretty_size(1)];
-                        ESP_LOG2(TAG, "[%d] Received command: [%s]", millis(), format_hex_pretty_to(hex, &this->rx_packet_[0], 1));
+#if RATGDO_SECPLUS1_DIAGNOSTICS
+                        ESP_LOGD(TAG, "[%" PRIu32 "] RX command: [%s]", millis(), format_hex_pretty_to(hex, &this->rx_packet_[0], 1));
+#else
+                        ESP_LOG2(TAG, "[%" PRIu32 "] Received command: [%s]", millis(), format_hex_pretty_to(hex, &this->rx_packet_[0], 1));
+#endif
                     }
                     return this->decode_packet(this->rx_packet_);
                 }
@@ -672,7 +706,7 @@ namespace secplus1 {
                 this->rx_packet_[this->rx_byte_count_++] = ser_byte;
                 {
                     char hex[format_hex_pretty_size(1)];
-                    ESP_LOG2(TAG, "[%d] Received byte: [%s]", millis(), format_hex_pretty_to(hex, &ser_byte, 1));
+                    ESP_LOG2(TAG, "[%" PRIu32 "] Received byte: [%s]", millis(), format_hex_pretty_to(hex, &ser_byte, 1));
                 }
 
                 if (this->rx_byte_count_ == RX_LENGTH) {
@@ -689,7 +723,13 @@ namespace secplus1 {
                 // discard it so we can read the following packet correctly
                 {
                     char hex[format_hex_pretty_size(1)];
-                    ESP_LOGW(TAG, "[%d] Discard incomplete packet: [%s ...]", millis(), format_hex_pretty_to(hex, &this->rx_packet_[0], 1));
+#if RATGDO_SECPLUS1_DIAGNOSTICS
+                    ESP_LOGW(TAG, "[%" PRIu32 "] Discard incomplete packet: [%s ...] length=%u rx_age=%" PRIu32 " tx_age=%" PRIu32 " queued=%u",
+                        millis(), format_hex_pretty_to(hex, &this->rx_packet_[0], 1), this->rx_byte_count_,
+                        millis() - this->last_rx_, millis() - this->last_tx_, static_cast<unsigned>(this->pending_tx_.size()));
+#else
+                    ESP_LOGW(TAG, "[%" PRIu32 "] Discard incomplete packet: [%s ...]", millis(), format_hex_pretty_to(hex, &this->rx_packet_[0], 1));
+#endif
                 }
                 this->flags_.rx_reading_msg = false;
                 this->rx_byte_count_ = 0;
@@ -703,14 +743,18 @@ namespace secplus1 {
     {
         constexpr size_t hex_size = format_hex_pretty_size(RX_LENGTH);
         char hex[hex_size];
-        ESP_LOG2(TAG, "[%d] Received packet: [%s]", millis(), format_hex_pretty_to(hex, packet, RX_LENGTH));
+#if RATGDO_SECPLUS1_DIAGNOSTICS
+        ESP_LOGD(TAG, "[%" PRIu32 "] RX packet: [%s] tx_age=%" PRIu32, millis(), format_hex_pretty_to(hex, packet, RX_LENGTH), millis() - this->last_tx_);
+#else
+        ESP_LOG2(TAG, "[%" PRIu32 "] Received packet: [%s]", millis(), format_hex_pretty_to(hex, packet, RX_LENGTH));
+#endif
     }
 
     void Secplus1::print_tx_packet(const TxPacket& packet) const
     {
         constexpr size_t hex_size = format_hex_pretty_size(TX_LENGTH);
         char hex[hex_size];
-        ESP_LOG2(TAG, "[%d] Sending packet: [%s]", millis(), format_hex_pretty_to(hex, packet, TX_LENGTH));
+        ESP_LOG2(TAG, "[%" PRIu32 "] Sending packet: [%s]", millis(), format_hex_pretty_to(hex, packet, TX_LENGTH));
     }
 
     optional<RxCommand> Secplus1::decode_packet(const RxPacket& packet) const
@@ -777,9 +821,19 @@ namespace secplus1 {
                     this->schedule_door_status_probe_(DOOR_STATUS_FAST_INTERVAL);
                 }
                 this->maybe_door_state = door_state;
+                this->maybe_door_state_since_ = millis();
+#if RATGDO_SECPLUS1_DIAGNOSTICS
+                ESP_LOGD(TAG, "[%" PRIu32 "] Door candidate=%s reply=%02X held=%s; waiting for confirmation",
+                    millis(), LOG_STR_ARG(DoorState_to_string(door_state)), cmd.resp, LOG_STR_ARG(DoorState_to_string(this->door_state)));
+#else
                 ESP_LOG1(TAG, "Door maybe %s, waiting for 2nd status message to confirm", LOG_STR_ARG(DoorState_to_string(door_state)));
+#endif
             } else {
                 const bool state_changed = this->door_state != door_state;
+#if RATGDO_SECPLUS1_DIAGNOSTICS
+                ESP_LOGD(TAG, "[%" PRIu32 "] Door confirmed=%s reply=%02X changed=%u candidate_age=%" PRIu32,
+                    millis(), LOG_STR_ARG(DoorState_to_string(door_state)), cmd.resp, state_changed, millis() - this->maybe_door_state_since_);
+#endif
                 this->maybe_door_state = door_state;
                 this->door_state = door_state;
                 this->flags_.door_moving = door_state == DoorState::OPENING || door_state == DoorState::CLOSING;
@@ -794,7 +848,13 @@ namespace secplus1 {
                     // and must dispatch using the newly committed state.
                     this->on_door_state_.trigger(door_state);
                 }
-                this->ratgdo_->received(door_state);
+                // Only use the candidate timestamp after it passed confirmation.
+                // This accounts for the two-read delay without trusting a lone reply.
+                const auto now = millis();
+                const auto observed_at = !this->flags_.is_0x37_panel && now - this->maybe_door_state_since_ <= 10000
+                    ? this->maybe_door_state_since_
+                    : now; // Do not extrapolate across a long gap without valid replies.
+                this->ratgdo_->received(door_state, observed_at);
                 this->maybe_run_deferred_door_action_();
             }
         } else if (cmd.req == CommandType::QUERY_DOOR_STATUS_0x37) {
@@ -891,6 +951,10 @@ namespace secplus1 {
             time = millis();
         }
         this->pending_tx_.push(TxCommand { cmd, door_warmup, time });
+#if RATGDO_SECPLUS1_DIAGNOSTICS
+        ESP_LOGD(TAG, "[%" PRIu32 "] Queue byte: [%02X] due=%" PRIu32 " warmup=%u depth=%u",
+            millis(), static_cast<unsigned>(cmd), time, door_warmup, static_cast<unsigned>(this->pending_tx_.size()));
+#endif
     }
 
     void Secplus1::cancel_pending_door_presses_()
@@ -929,6 +993,10 @@ namespace secplus1 {
 
     void Secplus1::transmit_byte(uint32_t value)
     {
+#if RATGDO_SECPLUS1_DIAGNOSTICS
+        const auto previous_tx = this->last_tx_;
+        const auto previous_rx = this->last_rx_;
+#endif
         bool enable_rx = (value == 0x38) || (value == 0x39) || (value == 0x3A);
         if (!enable_rx) {
             this->uart_.enableIntTx(false);
@@ -941,7 +1009,13 @@ namespace secplus1 {
         {
             uint8_t byte_val = static_cast<uint8_t>(value);
             char hex[format_hex_pretty_size(1)];
-            ESP_LOGD(TAG, "[%d] Sent byte: [%s]", millis(), format_hex_pretty_to(hex, &byte_val, 1));
+#if RATGDO_SECPLUS1_DIAGNOSTICS
+            ESP_LOGD(TAG, "[%" PRIu32 "] Sent byte: [%s] tx_gap=%" PRIu32 " rx_gap=%" PRIu32 " rx_partial=%u queued=%u",
+                millis(), format_hex_pretty_to(hex, &byte_val, 1), this->last_tx_ - previous_tx,
+                this->last_tx_ - previous_rx, this->flags_.rx_reading_msg, static_cast<unsigned>(this->pending_tx_.size()));
+#else
+            ESP_LOGD(TAG, "[%" PRIu32 "] Sent byte: [%s]", millis(), format_hex_pretty_to(hex, &byte_val, 1));
+#endif
         }
     }
 

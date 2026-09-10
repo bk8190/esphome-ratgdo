@@ -51,6 +51,36 @@ ESP8266 boards continue to use the Arduino framework as ESPHome requires it on t
 
 ## Troubleshooting
 
+### Security+ 1.0 packet diagnostics
+
+Additional packet, state-confirmation, transmit-queue, and timing logs are disabled
+by default. To include them in a troubleshooting build, merge this into the device
+YAML, preserving any existing build flags:
+
+```yaml
+esphome:
+  platformio_options:
+    build_flags:
+      - -DRATGDO_SECPLUS1_DIAGNOSTICS=1
+
+logger:
+  level: DEBUG
+```
+
+Rebuild and flash to change this option. Set the flag to `0` or omit it to compile
+out the added tracing and its argument evaluation. Ordinary logs and command
+diagnostic counters remain available. Startup configuration reports whether packet
+diagnostics are enabled. Runtime log-level changes cannot enable compiled-out tracing.
+
+Extra logging can affect this timing-sensitive protocol. Capture logs externally
+when investigating a failure; enabling the flag does not archive them. Commands
+from a partially stopped door do not arm the recovery watch, so a missed command
+from that state can leave all command counters unchanged.
+
+Security+ 1.0 partial positions are travel-time estimates. Only opener endpoint
+reports publish 0% or 100%; other states remain within 1–99%. Partial moves require
+a valid starting estimate and calibrated travel durations.
+
 ### False obstruction events on ESP32 v2.5 boards
 
 Some v2.5 boards using ESP32 D1 Mini controllers may report spurious obstruction events. This is caused by the obstruction sensor "asleep" detection logic being inverted on these boards.

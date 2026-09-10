@@ -156,8 +156,16 @@ public:
 
     unsigned long door_start_moving { 0 };
     float door_start_position { DOOR_POSITION_UNKNOWN };
+    // Position-estimation direction from the last movement state: +1 or -1.
     float door_move_delta { DOOR_DELTA_UNKNOWN };
     uint16_t position_sync_remaining_ { 0 };
+#ifdef PROTOCOL_SECPLUSV1
+    optional<float> position_target_;
+    DoorState position_target_direction_ { DoorState::UNKNOWN };
+    bool position_target_tracking_ { false };
+    void cancel_position_target_();
+    void update_position_target_(DoorState state);
+#endif
 
     single_observable<LightState> light_state { LightState::UNKNOWN };
     single_observable<LockState> lock_state { LockState::UNKNOWN };
@@ -202,7 +210,7 @@ public:
 
     Result call_protocol(Args args);
 
-    void received(const DoorState door_state);
+    void received(const DoorState door_state, uint32_t observed_at = 0);
     void received(const LightState light_state);
     void received(const LockState lock_state);
     void received(const ObstructionState obstruction_state);
@@ -233,7 +241,7 @@ public:
     void set_closing_delay(uint32_t delay) { this->closing_delay = delay; }
 #endif
     void schedule_door_position_sync(float update_period = 500);
-    void door_position_update();
+    void door_position_update(uint32_t observed_at = 0);
     void cancel_position_sync_callbacks();
 #ifdef RATGDO_USE_DISTANCE_SENSOR
     void set_target_distance_measurement(int16_t distance);
@@ -536,6 +544,7 @@ namespace scheduler_ids {
         TIMEOUT_DOOR_QUERY_STATE,
         TIMEOUT_DOOR_ACTION,
         TIMEOUT_MOVE_TO_POSITION,
+        TIMEOUT_POSITION_CONFIRM,
         TIMEOUT_CLEAR_MOTION,
         // Shared by RATGDOComponent and Secplus1 — safe because only one
         // protocol is compiled at a time (#ifdef PROTOCOL_SECPLUSV1) and

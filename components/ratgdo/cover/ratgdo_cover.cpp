@@ -59,6 +59,15 @@ void RATGDOCover::on_door_state(DoorState state, float position)
         break;
     }
 
+#ifdef PROTOCOL_SECPLUSV1
+    // The native cover API has no missing-position value. As in ESPHome's
+    // feedback cover, reserve endpoints for actual endpoint reports. Interior
+    // percentages remain estimates, including this 1%/99% endpoint guard.
+    if (state != DoorState::OPEN && state != DoorState::CLOSED) {
+        this->position = clamp(this->position, 0.01f, 0.99f);
+        save_to_flash = false;
+    }
+#endif
     this->publish_state(save_to_flash);
 }
 

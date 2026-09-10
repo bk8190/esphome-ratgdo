@@ -24,6 +24,7 @@
 #define LOG_STR(x) x
 
 namespace esphome {
+using std::clamp;
 inline uint32_t test_millis = 1000;
 inline uint32_t millis() { return test_millis; }
 template <typename T>
@@ -45,6 +46,18 @@ public:
     };
     using Key = std::pair<void*, uint32_t>;
     std::map<Key, Timer> timers;
+    struct Interval {
+        uint32_t at;
+        uint32_t period;
+        std::function<void()> callback;
+    };
+    // ESPHome has separate namespaces for interval and timeout IDs.
+    std::map<Key, Interval> intervals;
+    template <typename F>
+    void set_interval(void* owner, uint32_t id, uint32_t period, F callback)
+    {
+        intervals[{ owner, id }] = { millis() + period, period, callback };
+    }
     template <typename F>
     void set_timeout(void* owner, uint32_t id, uint32_t delay, F callback)
     {
@@ -58,9 +71,19 @@ public:
                 return static_cast<int32_t>(millis() - item.second.at) >= 0;
             });
             if (it == timers.end())
-                return;
+                break;
             auto callback = it->second.callback;
             timers.erase(it);
+            callback();
+        }
+        while (true) {
+            auto it = std::find_if(intervals.begin(), intervals.end(), [](const auto& item) {
+                return static_cast<int32_t>(millis() - item.second.at) >= 0;
+            });
+            if (it == intervals.end())
+                return;
+            auto callback = it->second.callback;
+            it->second.at += it->second.period;
             callback();
         }
     }

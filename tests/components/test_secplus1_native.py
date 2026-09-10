@@ -1,7 +1,8 @@
 """Run production Sec+1 C++ against a simulated clock, UART, and opener.
 
-The source/header, queue, parser, callbacks, recovery, and component command
-methods are real. ESPHome scheduling and hardware are replaced; these tests
+The source/header, queue, parser, callbacks, recovery, component command/state/
+position methods, and cover control/mapping are real. ESPHome scheduling,
+subscriber delivery, transport, and hardware are replaced; these tests
 cannot establish electrical timing or real-opener compatibility.
 """
 
@@ -28,8 +29,10 @@ def function_definition(source: str, pattern: str) -> str:
     return source[match.start() : end]
 
 
-@pytest.fixture(scope="session")
-def native_runner(tmp_path_factory):
+@pytest.fixture(
+    scope="session", params=[0, 1], ids=["diagnostics_off", "diagnostics_on"]
+)
+def native_runner(tmp_path_factory, request):
     compiler = shutil.which("g++")
     assert compiler, "Native firmware tests require g++"
     build = tmp_path_factory.mktemp("secplus1-native")
@@ -72,10 +75,27 @@ def native_runner(tmp_path_factory):
             "door_action",
             "set_door_state_expiry",
             "cancel_door_state_expiry",
+            "door_move_to_position",
+            "schedule_door_position_sync",
+            "door_position_update",
+            "cancel_position_sync_callbacks",
+            "cancel_position_target_",
+            "update_position_target_",
         )
     )
+    methods.append(
+        function_definition(
+            source,
+            r"void RATGDOComponent::received\(const DoorState door_state, uint32_t observed_at\)",
+        )
+    )
+    cover_source = (COMPONENT / "cover" / "ratgdo_cover.cpp").read_text()
+    methods.extend(
+        function_definition(cover_source, rf"void RATGDOCover::{name}\(")
+        for name in ("control", "on_door_state")
+    )
     (build / "component_methods.cpp").write_text(
-        '#include "ratgdo.h"\nnamespace esphome::ratgdo {\nusing namespace scheduler_ids;\n'
+        '#include "cover_stub.h"\nnamespace esphome::ratgdo {\nusing namespace scheduler_ids;\n'
         + "\n".join(methods)
         + "\n}\n"
     )
@@ -90,6 +110,7 @@ def native_runner(tmp_path_factory):
             "-fsanitize=undefined",
             "-fno-sanitize-recover=all",
             "-DPROTOCOL_SECPLUSV1",
+            f"-DRATGDO_SECPLUS1_DIAGNOSTICS={request.param}",
             "-include",
             str(NATIVE / "runtime.h"),
             "-I",
@@ -136,6 +157,24 @@ def native_runner(tmp_path_factory):
         "boot_and_deferred_actions",
         "direction_waits_for_confirmation",
         "timeout_owners_independent",
+        "opening_at_estimated_open",
+        "slider_direction_mismatch",
+        "slider_pending_target_does_not_change_estimator",
+        "position_reversal_and_stop",
+        "partial_open_stops_between_endpoints",
+        "partial_stop_before_confirmation",
+        "partial_timer_survives_new_command",
+        "stopped_at_estimated_closed",
+        "partial_accounts_for_confirmation_delay",
+        "partial_waits_through_direction_sequence",
+        "partial_latest_target_while_moving",
+        "partial_unverified_expires",
+        "partial_new_command_cancels_active_timer",
+        "endpoints_require_status",
+        "partial_rejects_untrusted_start",
+        "partial_satisfied_cancels_queued_start",
+        "partial_abort_preserves_release",
+        "stale_candidate_does_not_backdate_position",
     ],
 )
 def test_secplus1_scenario(native_runner, scenario):
