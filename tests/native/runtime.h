@@ -95,6 +95,8 @@ namespace ratgdo {
         std::deque<uint8_t> rx;
         std::vector<std::pair<uint32_t, uint8_t>> tx;
         std::function<optional<uint8_t>(uint8_t)> respond;
+        // Real hardware hears its own byte even when the opener stays silent.
+        bool echo_unanswered = false;
         void begin(int, int, int, int, bool) { }
         void on_shutdown() { }
         void enableIntTx(bool) { }
@@ -114,6 +116,8 @@ namespace ratgdo {
                 if (reply) {
                     rx.push_back(byte);
                     rx.push_back(*reply);
+                } else if (echo_unanswered) {
+                    rx.push_back(byte);
                 }
             }
         }

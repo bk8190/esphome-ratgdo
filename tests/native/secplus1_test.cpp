@@ -41,8 +41,17 @@ struct Rig {
     bool actuate = false;
     bool noise_once = false;
     bool drop_queries = false;
+    // Answer until the first heard press, then let the test feed replies.
+    bool drop_after_press = false;
     bool reverse_by_stopping = false;
+    // Field-observed failure: until this time the opener ignores presses and
+    // does not answer queries (only the ratgdo's own echo comes back).
+    uint32_t deaf_until = 0;
+    // Until this time door-status replies are garbled (decode as UNKNOWN).
+    uint32_t garble_until = 0;
     int presses = 0;
+    int ignored_presses = 0;
+    uint32_t first_press_at = 0;
 
     explicit Rig(DoorState initial = DoorState::CLOSED)
         : physical(initial)
@@ -56,6 +65,12 @@ struct Rig {
         protocol.maybe_door_state = initial;
         protocol.uart_.respond = [this](uint8_t command) -> optional<uint8_t> {
             if (command == 0x30) {
+                if (millis() < deaf_until) {
+                    ++ignored_presses;
+                    return { };
+                }
+                if (presses == 0)
+                    first_press_at = millis();
                 ++presses;
                 if (actuate) {
                     if (physical == DoorState::CLOSED)
@@ -70,8 +85,10 @@ struct Rig {
                         physical = DoorState::OPENING;
                 }
             }
-            if (command != 0x38 || drop_queries)
+            if (command != 0x38 || drop_queries || (drop_after_press && presses > 0) || millis() < deaf_until)
                 return { };
+            if (millis() < garble_until)
+                return 0xff;
             if (noise_once && presses == 1) {
                 noise_once = false;
                 return 0x52; // One corrupt but valid OPEN during a missed OPEN.
@@ -310,7 +327,7 @@ void warmup_queue_bounded()
     rig.component.query_status(); // Preserve independent diagnostic queries.
     for (int i = 0; i < 20; ++i)
         rig.component.door_toggle();
-    CHECK(rig.protocol.pending_tx_.size() == 8); // 4 diagnostics + 3 warm-ups + press.
+    CHECK(rig.protocol.pending_tx_.size() == 7); // 4 diagnostics + 3 warm-ups; press waits at the gate.
     rig.run(5000);
     CHECK(rig.presses == 1);
     CHECK(rig.sent(0x39) == 1);
@@ -496,7 +513,7 @@ void stopped_at_estimated_closed()
 void partial_accounts_for_confirmation_delay()
 {
     Rig rig;
-    rig.drop_queries = true;
+    rig.drop_after_press = true;
     rig.component.opening_duration = 10;
     rig.component.closing_duration = 10;
     rig.cover.control({ 0.5f });
@@ -652,6 +669,105 @@ void stale_candidate_does_not_backdate_position()
     CHECK(*rig.component.door_position == 0.0f);
 }
 
+// Press gate: hold a stationary-door press until the opener answers again.
+void gate_keeps_healthy_timing()
+{
+    Rig rig;
+    rig.actuate = true;
+    rig.protocol.uart_.echo_unanswered = true;
+    const auto start = millis();
+    rig.component.door_open();
+    rig.until([&] { return rig.presses == 1; });
+    CHECK(rig.first_press_at - start <= 700); // Same as the fixed 3-query warm-up.
+    CHECK(rig.sent(0x38) == 3);
+}
+
+void gate_waits_out_deaf_window()
+{
+    Rig rig;
+    rig.actuate = true;
+    rig.protocol.uart_.echo_unanswered = true;
+    rig.deaf_until = millis() + 4000;
+    rig.component.door_open();
+    rig.run(15000);
+    CHECK(rig.ignored_presses == 0);
+    CHECK(rig.presses == 1);
+    CHECK(rig.first_press_at >= rig.deaf_until);
+    CHECK(rig.first_press_at <= rig.deaf_until + 1000);
+    CHECK(*rig.component.door_state == DoorState::OPENING);
+    CHECK(rig.component.stats.retries == 0);
+    CHECK(rig.component.stats.unverified == 0);
+}
+
+void gate_needs_consecutive_valid_replies()
+{
+    Rig rig;
+    rig.actuate = true;
+    rig.garble_until = millis() + 2000;
+    rig.component.door_open();
+    rig.run(10000);
+    CHECK(rig.presses == 1);
+    CHECK(rig.first_press_at >= rig.garble_until + 200); // Two clean replies after the garble.
+    CHECK(rig.component.stats.unverified == 0);
+}
+
+void gate_deadline_presses_anyway()
+{
+    Rig rig;
+    rig.actuate = true;
+    rig.protocol.uart_.echo_unanswered = true;
+    const auto start = millis();
+    rig.deaf_until = start + 60000;
+    rig.component.door_open();
+    rig.run(10000 - 1);
+    CHECK(rig.ignored_presses == 0);
+    rig.run(1000);
+    CHECK(rig.ignored_presses == 1); // Pressed at the deadline.
+    rig.run(20000);
+    CHECK(rig.ignored_presses == 1); // No retry without valid baseline reads.
+    CHECK(rig.component.stats.unverified == 1);
+}
+
+void gated_retry_outlasts_watch()
+{
+    Rig rig;
+    rig.protocol.uart_.echo_unanswered = true;
+    rig.start_retry(); // First press heard but ignored; retry starts its gate.
+    rig.actuate = true;
+    rig.deaf_until = millis() + 9000;
+    rig.run(20000);
+    CHECK(rig.presses == 2);
+    CHECK(*rig.component.door_state == DoorState::OPENING);
+    CHECK(rig.component.stats.retries == 1);
+    CHECK(rig.component.stats.retry_failures == 0);
+    CHECK(rig.component.stats.unverified == 0);
+}
+
+void gated_direction_sequence_keeps_callback()
+{
+    Rig rig(DoorState::STOPPED);
+    rig.actuate = true;
+    rig.protocol.uart_.echo_unanswered = true;
+    rig.deaf_until = millis() + 9000;
+    rig.component.door_open(); // Press, confirm CLOSING, press again to reverse.
+    rig.run(25000);
+    CHECK(rig.presses == 2);
+    CHECK(*rig.component.door_state == DoorState::OPENING);
+}
+
+void cancel_drops_gated_press()
+{
+    Rig rig;
+    rig.protocol.uart_.echo_unanswered = true;
+    rig.deaf_until = millis() + 3000;
+    rig.component.door_open();
+    rig.run(1000);
+    rig.component.door_stop(); // Stationary STOP supersedes the waiting OPEN.
+    rig.run(15000);
+    CHECK(rig.presses == 0);
+    CHECK(rig.ignored_presses == 0);
+}
+
 int main(int argc, char** argv)
 {
     const std::map<std::string, void (*)()> scenarios = {
@@ -693,6 +809,13 @@ int main(int argc, char** argv)
         { "partial_satisfied_cancels_queued_start", partial_satisfied_cancels_queued_start },
         { "partial_abort_preserves_release", partial_abort_preserves_release },
         { "stale_candidate_does_not_backdate_position", stale_candidate_does_not_backdate_position },
+        { "gate_keeps_healthy_timing", gate_keeps_healthy_timing },
+        { "gate_waits_out_deaf_window", gate_waits_out_deaf_window },
+        { "gate_needs_consecutive_valid_replies", gate_needs_consecutive_valid_replies },
+        { "gate_deadline_presses_anyway", gate_deadline_presses_anyway },
+        { "gated_retry_outlasts_watch", gated_retry_outlasts_watch },
+        { "gated_direction_sequence_keeps_callback", gated_direction_sequence_keeps_callback },
+        { "cancel_drops_gated_press", cancel_drops_gated_press },
     };
     try {
         CHECK(argc == 2);

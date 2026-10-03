@@ -32,6 +32,14 @@ namespace secplus1 {
     // instead of being dropped into an idle bus.
     static constexpr uint8_t DOOR_PRESS_WARMUP_QUERIES = 3;
     static constexpr uint32_t DOOR_PRESS_WARMUP_INTERVAL = 200; // ms between warm-up queries and before the press
+    // The opener periodically stops answering for a few seconds, and a press
+    // sent then is ignored: field logs showed 29/33 first presses missed after
+    // 2+ unanswered warm-up queries, versus 0/36 otherwise. Hold the press until
+    // this many consecutive valid replies arrive, re-querying while silent, and
+    // press anyway at the deadline (below the 12s watch/callback timeouts).
+    static constexpr uint8_t DOOR_PRESS_GATE_GOOD_REPLIES = 2;
+    static constexpr uint32_t DOOR_PRESS_GATE_RECHECK = 250;
+    static constexpr uint32_t DOOR_PRESS_GATE_DEADLINE = 10000;
     static constexpr uint8_t DOOR_COMMAND_BASELINE_CONFIRMATIONS = 2;
     static constexpr uint32_t DOOR_COMMAND_RETRY_MIN_DELAY = 3000;
     // Watch verdicts consume only two-read-confirmed states. Noise that decodes
@@ -634,18 +642,110 @@ namespace secplus1 {
         // bus is already warm from motion traffic, and the corrective toggles of
         // the Sec+1 single-button direction sequence (see door_action STOP /
         // OPEN-from-STOPPED) must land promptly to minimize overshoot.
+        //
+        // The warm-up replies also show whether the opener is listening. The
+        // press waits behind the press gate until they are healthy.
         auto now = millis();
-        uint32_t press_delay = 0;
+        // A newer toggle supersedes a press still waiting at the gate.
+        this->clear_door_press_gate_();
         if (this->door_state != DoorState::OPENING && this->door_state != DoorState::CLOSING) {
             for (uint8_t i = 0; i < DOOR_PRESS_WARMUP_QUERIES; i++) {
                 this->enqueue_transmit(CommandType::QUERY_DOOR_STATUS, now + i * DOOR_PRESS_WARMUP_INTERVAL, true);
             }
-            press_delay = DOOR_PRESS_WARMUP_QUERIES * DOOR_PRESS_WARMUP_INTERVAL;
+            this->start_door_press_gate_(now + DOOR_PRESS_WARMUP_QUERIES * DOOR_PRESS_WARMUP_INTERVAL);
+        } else {
+            this->enqueue_transmit(CommandType::TOGGLE_DOOR_PRESS, now);
         }
-        this->enqueue_transmit(CommandType::TOGGLE_DOOR_PRESS, now + press_delay);
         if (this->door_state == DoorState::STOPPED || this->door_state == DoorState::OPEN || this->door_state == DoorState::CLOSED) {
             this->flags_.door_moving = true;
         }
+    }
+
+    void Secplus1::start_door_press_gate_(uint32_t first_check)
+    {
+        this->door_press_gate_active_ = true;
+        this->door_press_gate_awaiting_ = false;
+        this->door_press_gate_good_ = 0;
+        this->door_press_gate_started_ = millis();
+        // The press can now wait up to the gate deadline. Restart a watched
+        // command's failsafe (including a retry's) so it outlasts the gate.
+        if (this->watched_door_action_ != DoorAction::UNKNOWN) {
+            this->schedule_door_command_watch_timeout_();
+        }
+        this->scheduler_->set_timeout(this->ratgdo_, TIMEOUT_DOOR_PRESS_GATE, first_check - millis(), [this]() {
+            this->check_door_press_gate_();
+        });
+    }
+
+    void Secplus1::check_door_press_gate_()
+    {
+        if (!this->door_press_gate_active_) {
+            return;
+        }
+        if (this->cancel_unsafe_retry_press_()) {
+            return;
+        }
+        const auto waited = millis() - this->door_press_gate_started_;
+        const bool healthy = this->door_press_gate_good_ >= DOOR_PRESS_GATE_GOOD_REPLIES;
+        if (healthy || waited >= DOOR_PRESS_GATE_DEADLINE) {
+            if (!healthy) {
+                ESP_LOGW(TAG, "Opener not answering status queries after %" PRIu32 "ms; pressing anyway", waited);
+            } else if (waited > DOOR_PRESS_WARMUP_QUERIES * DOOR_PRESS_WARMUP_INTERVAL + DOOR_PRESS_GATE_RECHECK) {
+                ESP_LOGI(TAG, "Door press held %" PRIu32 "ms until the opener answered", waited);
+            }
+            this->clear_door_press_gate_();
+            this->enqueue_transmit(CommandType::TOGGLE_DOOR_PRESS);
+            // A direction sequence waits for the result of this press. Time its
+            // callback from the press, not from the original request.
+            if (this->on_door_state_.count()) {
+                this->set_door_state_expiry();
+            }
+            return;
+        }
+        // Keep asking while the opener is silent; loop() spaces transmissions.
+        if (this->pending_tx_.empty()) {
+            this->enqueue_transmit(CommandType::QUERY_DOOR_STATUS, 0, true);
+        }
+        this->scheduler_->set_timeout(this->ratgdo_, TIMEOUT_DOOR_PRESS_GATE, DOOR_PRESS_GATE_RECHECK, [this]() {
+            this->check_door_press_gate_();
+        });
+    }
+
+    void Secplus1::clear_door_press_gate_()
+    {
+        this->scheduler_->cancel_timeout(this->ratgdo_, TIMEOUT_DOOR_PRESS_GATE);
+        this->door_press_gate_active_ = false;
+        this->door_press_gate_awaiting_ = false;
+        this->door_press_gate_good_ = 0;
+    }
+
+    void Secplus1::note_door_press_gate_reply_(bool valid)
+    {
+        if (!this->door_press_gate_active_) {
+            return;
+        }
+        this->door_press_gate_awaiting_ = false;
+        if (!valid) {
+            this->door_press_gate_good_ = 0;
+        } else if (this->door_press_gate_good_ < UINT8_MAX) {
+            this->door_press_gate_good_++;
+        }
+    }
+
+    bool Secplus1::cancel_unsafe_retry_press_()
+    {
+        // Even an unconfirmed change since the miss makes a retry unsafe. Do
+        // not send it and do not claim successful recovery.
+        if (!this->flags_.door_command_retried
+            || (this->door_state == this->watched_door_baseline_ && this->maybe_door_state == this->watched_door_baseline_)) {
+            return false;
+        }
+        this->door_command_unverified_++;
+        this->log_door_command_stats_("retry cancelled before transmit");
+        this->cancel_pending_door_presses_();
+        this->clear_door_command_watch_();
+        this->publish_door_command_stats_();
+        return true;
     }
 
     Result Secplus1::call(Args args)
@@ -733,6 +833,8 @@ namespace secplus1 {
                 }
                 this->flags_.rx_reading_msg = false;
                 this->rx_byte_count_ = 0;
+                // Usually our own query echo with no reply from the opener.
+                this->note_door_press_gate_reply_(false);
             }
         }
 
@@ -800,6 +902,7 @@ namespace secplus1 {
             } else {
                 door_state = DoorState::UNKNOWN;
             }
+            this->note_door_press_gate_reply_(door_state != DoorState::UNKNOWN);
 
             // A single UNKNOWN (garbled/noise) read must not disturb a real
             // state we already hold or a real candidate we are confirming.
@@ -911,16 +1014,15 @@ namespace secplus1 {
     {
         auto cmd = this->pop_pending_tx();
         if (cmd) {
-            if (cmd.value() == CommandType::TOGGLE_DOOR_PRESS && this->flags_.door_command_retried
-                && (this->door_state != this->watched_door_baseline_ || this->maybe_door_state != this->watched_door_baseline_)) {
-                // Even an unconfirmed change during warm-up makes a retry
-                // unsafe. Do not send it and do not claim successful recovery.
-                this->door_command_unverified_++;
-                this->log_door_command_stats_("retry cancelled before transmit");
-                this->cancel_pending_door_presses_();
-                this->clear_door_command_watch_();
-                this->publish_door_command_stats_();
+            if (cmd.value() == CommandType::TOGGLE_DOOR_PRESS && this->cancel_unsafe_retry_press_()) {
                 return true;
+            }
+            if (cmd.value() == CommandType::QUERY_DOOR_STATUS && this->door_press_gate_active_) {
+                // An earlier gated query that never got an answer breaks the run.
+                if (this->door_press_gate_awaiting_) {
+                    this->door_press_gate_good_ = 0;
+                }
+                this->door_press_gate_awaiting_ = true;
             }
             this->enqueue_command_pair(cmd.value());
             this->transmit_byte(static_cast<uint32_t>(cmd.value()));
@@ -959,6 +1061,8 @@ namespace secplus1 {
 
     void Secplus1::cancel_pending_door_presses_()
     {
+        // A press waiting at the gate is pending too.
+        this->clear_door_press_gate_();
         decltype(this->pending_tx_) remaining;
         while (!this->pending_tx_.empty()) {
             auto cmd = this->pending_tx_.top();

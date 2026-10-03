@@ -175,6 +175,13 @@ def native_runner(tmp_path_factory, request):
         "partial_satisfied_cancels_queued_start",
         "partial_abort_preserves_release",
         "stale_candidate_does_not_backdate_position",
+        "gate_keeps_healthy_timing",
+        "gate_waits_out_deaf_window",
+        "gate_needs_consecutive_valid_replies",
+        "gate_deadline_presses_anyway",
+        "gated_retry_outlasts_watch",
+        "gated_direction_sequence_keeps_callback",
+        "cancel_drops_gated_press",
     ],
 )
 def test_secplus1_scenario(native_runner, scenario):

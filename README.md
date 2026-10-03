@@ -77,6 +77,12 @@ when investigating a failure; enabling the flag does not archive them. Commands
 from a partially stopped door do not arm the recovery watch, so a missed command
 from that state can leave all command counters unchanged.
 
+Some Security+ 1.0 openers stop answering status queries for a few seconds at a
+time and ignore a button press sent then. Before pressing for a stationary door,
+ratgdo waits until two consecutive status queries are answered, for up to 10
+seconds. A delayed press logs `Door press held …`; reaching the limit logs
+`pressing anyway`.
+
 Security+ 1.0 partial positions are travel-time estimates. Only opener endpoint
 reports publish 0% or 100%; other states remain within 1–99%. Partial moves require
 a valid starting estimate and calibrated travel durations.

@@ -171,6 +171,13 @@ namespace secplus1 {
         // single reads are noisy enough to fake a "confirmed" verdict.
         void observe_door_command_status_(DoorState state);
         void clear_door_command_watch_();
+        // Hold a stationary-door press until the opener answers status queries
+        // again; a press sent while it is not replying is ignored.
+        void start_door_press_gate_(uint32_t first_check);
+        void check_door_press_gate_();
+        void clear_door_press_gate_();
+        void note_door_press_gate_reply_(bool valid);
+        bool cancel_unsafe_retry_press_();
         void log_door_command_stats_(const char* outcome) const;
         void publish_door_command_stats_();
 
@@ -197,6 +204,7 @@ namespace secplus1 {
         uint32_t door_command_retry_failures_ { 0 };
         uint32_t door_command_unverified_ { 0 };
         uint32_t door_command_duplicates_suppressed_ { 0 };
+        uint32_t door_press_gate_started_ { 0 };
 
         // Larger structures
         std::priority_queue<TxCommand, std::vector<TxCommand>, FirstToSend> pending_tx_;
@@ -220,6 +228,11 @@ namespace secplus1 {
         DoorAction watched_door_action_ { DoorAction::UNKNOWN };
         DoorState watched_door_baseline_ { DoorState::UNKNOWN };
         WallPanelEmulationState wall_panel_emulation_state_ { WallPanelEmulationState::WAITING };
+        // Consecutive valid door-status replies seen while a press is gated.
+        uint8_t door_press_gate_good_ { 0 };
+        bool door_press_gate_active_ { false };
+        // A gated query was sent and its reply has not been seen yet.
+        bool door_press_gate_awaiting_ { false };
         struct {
             uint8_t door_moving : 1;
             uint8_t wall_panel_starting : 1;
