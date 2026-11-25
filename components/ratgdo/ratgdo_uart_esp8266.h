@@ -53,6 +53,11 @@ public:
     // bus back while it is released. See secplus1_query_tx.h. Nothing of the
     // frame is received through SoftwareSerial; the caller stands in for the
     // echo when the result is SENT. Blocks for about two frame times.
+    // Diagnostic: poll the RX pin for duration_us and record each change of
+    // bus level as (microseconds since start) << 1 | (1 if the bus went low).
+    // Returns the number of entries written. Interrupts stay on.
+    size_t scope_capture(uint32_t duration_us, uint32_t* edges, size_t max_edges);
+
     // Defined in ratgdo_uart_esp8266.cpp so it can be placed in IRAM.
     secplus1::QueryTxResult send_query_checked(uint8_t byte, secplus1::QueryTxInfo* info = nullptr, int8_t abort_at_data_bit = -1);
 

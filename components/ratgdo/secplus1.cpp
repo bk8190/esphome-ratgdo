@@ -40,6 +40,11 @@
 #ifndef RATGDO_SECPLUS1_NO_PANEL_EMULATION
 #define RATGDO_SECPLUS1_NO_PANEL_EMULATION 0
 #endif
+// Diagnostic only (ESP8266): the Query status button first records the raw
+// bus level for 400 ms and logs every edge. Blocks the loop while it does.
+#ifndef RATGDO_SECPLUS1_BUS_SCOPE
+#define RATGDO_SECPLUS1_BUS_SCOPE 0
+#endif
 #if RATGDO_SECPLUS1_ABORT_TEST && !RATGDO_SECPLUS1_CHECKED_QUERY_TX
 #error "RATGDO_SECPLUS1_ABORT_TEST needs RATGDO_SECPLUS1_CHECKED_QUERY_TX"
 #endif
@@ -810,6 +815,9 @@ namespace secplus1 {
     Result Secplus1::call(Args args)
     {
         if (args.tag == Args::Tag::query_status) {
+#if RATGDO_SECPLUS1_BUS_SCOPE
+            this->bus_scope_();
+#endif
 #if RATGDO_SECPLUS1_ABORT_TEST
             this->abort_test_remaining_ = ABORT_TEST_FRAMES;
             this->abort_test_step_();
@@ -1304,6 +1312,25 @@ namespace secplus1 {
         } else {
             this->tx_query_retried_ = true;
             this->enqueue_transmit(to_CommandType(value, CommandType::QUERY_DOOR_STATUS), millis() + QUERY_RETRY_DELAY);
+        }
+    }
+#endif
+
+#if RATGDO_SECPLUS1_BUS_SCOPE
+    void Secplus1::bus_scope_()
+    {
+        static uint32_t edges[160];
+        const auto count = this->uart_.scope_capture(400000, edges, 160);
+        ESP_LOGI(TAG, "[%" PRIu32 "] Bus scope: %u edges in 400ms, tx_age=%" PRIu32 " rx_age=%" PRIu32 " (L=went low, H=went high, microseconds)",
+            millis(), static_cast<unsigned>(count), millis() - this->last_tx_, millis() - this->last_rx_);
+        char line[160];
+        size_t used = 0;
+        for (size_t i = 0; i < count; ++i) {
+            used += snprintf(line + used, sizeof(line) - used, " %c%" PRIu32, (edges[i] & 1) ? 'L' : 'H', edges[i] >> 1);
+            if (used > sizeof(line) - 14 || i + 1 == count) {
+                ESP_LOGI(TAG, "scope:%s", line);
+                used = 0;
+            }
         }
     }
 #endif

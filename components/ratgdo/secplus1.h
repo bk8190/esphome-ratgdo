@@ -159,6 +159,8 @@ namespace secplus1 {
         void transmit_byte(uint32_t value);
         // Checked sender for queries (RATGDO_SECPLUS1_CHECKED_QUERY_TX).
         void transmit_query_checked_(uint8_t value, int8_t abort_at_data_bit = -1);
+        // Diagnostic bus capture (RATGDO_SECPLUS1_BUS_SCOPE).
+        void bus_scope_();
         // Supervised hardware test (RATGDO_SECPLUS1_ABORT_TEST).
         void abort_test_step_();
 

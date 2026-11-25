@@ -43,6 +43,31 @@ IRAM_ATTR secplus1::QueryTxResult RatgdoUART::send_query_checked(uint8_t byte, s
     return secplus1::send_query_checked(bus, byte, info, abort_at_data_bit);
 }
 
+IRAM_ATTR size_t RatgdoUART::scope_capture(uint32_t duration_us, uint32_t* edges, size_t max_edges)
+{
+    if (this->rx_pin_ < 0 || this->rx_pin_ > 15) {
+        return 0;
+    }
+    const uint32_t mask = 1U << this->rx_pin_;
+    const bool invert = this->invert_;
+    const uint32_t start = ::micros();
+    bool low = ((GPI & mask) != 0) == invert;
+    size_t count = 0;
+    if (low && max_edges) {
+        edges[count++] = 1; // already low at the start
+    }
+    uint32_t now = 0;
+    while (now < duration_us && count < max_edges) {
+        const bool level = ((GPI & mask) != 0) == invert;
+        now = ::micros() - start;
+        if (level != low) {
+            low = level;
+            edges[count++] = (now << 1) | (low ? 1U : 0U);
+        }
+    }
+    return count;
+}
+
 } // namespace esphome::ratgdo
 
 #endif
