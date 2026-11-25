@@ -768,6 +768,86 @@ void cancel_drops_gated_press()
     CHECK(rig.ignored_presses == 0);
 }
 
+// A query that reaches the bus as 0x30 is a door press to the opener. It must
+// not be reported as a wall-panel button, and the door is watched closely.
+void echo_read_as_press()
+{
+    Rig rig;
+    rig.protocol.uart_.corrupt_next_echo = 0x30;
+    rig.protocol.door_status_probe_();
+    rig.run(50);
+    CHECK(rig.sent(0x38) == 1);
+    CHECK(rig.component.stats.tx_echo_errors == 1);
+    CHECK(rig.component.button_presses == 0);
+    CHECK(*rig.component.door_state == DoorState::CLOSED);
+    rig.physical = DoorState::OPENING; // the opener acted on the corrupted byte
+    rig.run(6000);
+    CHECK(*rig.component.door_state == DoorState::OPENING);
+    CHECK(rig.presses == 0);
+}
+
+// Garbage that is not a panel command is dropped without raising the alarm,
+// and the next query is parsed normally.
+void echo_garbage_dropped()
+{
+    Rig rig;
+    rig.protocol.uart_.corrupt_next_echo = 0x70;
+    rig.protocol.door_status_probe_();
+    rig.run(50);
+    CHECK(rig.component.stats.tx_echo_errors == 0);
+    CHECK(rig.component.button_presses == 0);
+    rig.physical = DoorState::OPEN;
+    rig.protocol.door_status_probe_();
+    rig.run(6000);
+    CHECK(*rig.component.door_state == DoorState::OPEN);
+}
+
+// A reply byte that happens to follow a lost echo is not taken for a command.
+void echo_lost_then_reply()
+{
+    Rig rig;
+    rig.protocol.uart_.corrupt_next_echo = 0x30;
+    rig.protocol.door_status_probe_();
+    rig.protocol.uart_.rx.push_back(0x55);
+    rig.run(200);
+    CHECK(rig.component.stats.tx_echo_errors == 1);
+    CHECK(rig.component.button_presses == 0);
+    CHECK(*rig.component.door_state == DoorState::CLOSED);
+}
+
+// A settled door is re-checked every 5 minutes, not every 10 seconds.
+void idle_probe_is_slow()
+{
+    Rig rig;
+    rig.protocol.door_status_probe_();
+    rig.run(299000);
+    CHECK(rig.sent(0x38) == 1);
+    rig.run(2000);
+    CHECK(rig.sent(0x38) == 2);
+    CHECK(*rig.component.door_state == DoorState::CLOSED);
+}
+
+// A real wall-panel press is still reported, and the movement it causes is
+// picked up within seconds despite the slow idle rate.
+void wall_press_probes_fast()
+{
+    Rig rig;
+    rig.protocol.door_status_probe_();
+    rig.run(1000);
+    rig.protocol.uart_.rx.push_back(0x30);
+    rig.physical = DoorState::OPENING;
+    rig.run(6000);
+    CHECK(rig.component.button_presses == 1);
+    CHECK(rig.component.stats.tx_echo_errors == 0);
+    CHECK(*rig.component.door_state == DoorState::OPENING);
+    rig.physical = DoorState::OPEN;
+    rig.run(6000);
+    CHECK(*rig.component.door_state == DoorState::OPEN);
+    const auto queries = rig.sent(0x38);
+    rig.run(60000);
+    CHECK(rig.sent(0x38) - queries <= 6); // fast window ends, back to idle
+}
+
 int main(int argc, char** argv)
 {
     const std::map<std::string, void (*)()> scenarios = {
@@ -816,6 +896,11 @@ int main(int argc, char** argv)
         { "gated_retry_outlasts_watch", gated_retry_outlasts_watch },
         { "gated_direction_sequence_keeps_callback", gated_direction_sequence_keeps_callback },
         { "cancel_drops_gated_press", cancel_drops_gated_press },
+        { "echo_read_as_press", echo_read_as_press },
+        { "echo_garbage_dropped", echo_garbage_dropped },
+        { "echo_lost_then_reply", echo_lost_then_reply },
+        { "idle_probe_is_slow", idle_probe_is_slow },
+        { "wall_press_probes_fast", wall_press_probes_fast },
     };
     try {
         CHECK(argc == 2);

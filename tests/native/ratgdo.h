@@ -42,6 +42,7 @@ public:
     } flags_;
     bool sync_failed = false;
     DoorCommandStats stats { };
+    int button_presses = 0;
     template <typename F>
     void set_timeout(uint32_t id, uint32_t delay, F callback)
     {
@@ -62,6 +63,7 @@ public:
     template <typename T>
     void received(T) { }
     void received(DoorCommandStats value) { stats = value; }
+    void received(ButtonState value) { button_presses += value == ButtonState::PRESSED; }
     void received(DoorState value, uint32_t observed_at = 0);
     void door_move_to_position(float position);
     void schedule_door_position_sync(float update_period = 500);

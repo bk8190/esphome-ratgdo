@@ -66,6 +66,13 @@ sensor:
     name: "Door Command Suppressed"
     state_class: total_increasing
     icon: mdi:cancel
+  - platform: ratgdo
+    id: ${id_prefix}_door_tx_echo_errors
+    type: door_tx_echo_errors
+    entity_category: diagnostic
+    name: "Door Query Read Back As Command"
+    state_class: total_increasing
+    icon: mdi:alert-octagon-outline
 
 ota:
   - platform: esphome

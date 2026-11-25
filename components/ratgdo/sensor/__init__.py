@@ -31,6 +31,7 @@ TYPES = {
     "door_command_retry_failures": RATGDOSensorType.RATGDO_DOOR_COMMAND_RETRY_FAILURES,
     "door_command_unverified": RATGDOSensorType.RATGDO_DOOR_COMMAND_UNVERIFIED,
     "door_command_suppressed": RATGDOSensorType.RATGDO_DOOR_COMMAND_SUPPRESSED,
+    "door_tx_echo_errors": RATGDOSensorType.RATGDO_DOOR_TX_ECHO_ERRORS,
     "distance": RATGDOSensorType.RATGDO_DISTANCE,
     "encoder": RATGDOSensorType.RATGDO_ENCODER,
 }

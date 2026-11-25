@@ -60,6 +60,19 @@ namespace secplus1 {
     // capable panel is supplying door status and resume active probing. 3x the
     // 0x37 panel's ~10s poll interval, so an occasional missed poll won't trip it.
     static constexpr uint32_t DOOR_STATUS_PASSIVE_TIMEOUT = 30000;
+    // Every query is a byte on a shared bus that a collision or timing glitch
+    // can turn into another command: field logs show about 1 in 40,000-100,000
+    // 0x38 queries reading back as 0x30, a door press, with the door then
+    // moving. Exposure scales with the query count, so a settled door is only
+    // re-checked this often (it was 10s). This bounds how long an operation
+    // ratgdo cannot see (RF remote, mechanical) stays unreported.
+    static constexpr uint32_t DOOR_STATUS_IDLE_INTERVAL = 300000;
+    // After a hint that the door may be about to move (a wall-panel press, or
+    // one of our queries read back as a press), probe fast for this long so
+    // the movement is reported promptly despite the slow idle rate.
+    static constexpr uint32_t DOOR_STATUS_SUSPECT_WINDOW = 15000;
+    // Our own byte is read back within a few ms of sending it.
+    static constexpr uint32_t TX_ECHO_TIMEOUT = 100;
 
     void Secplus1::setup(RATGDOComponent* ratgdo, Scheduler* scheduler, InternalGPIOPin* rx_pin, InternalGPIOPin* tx_pin)
     {
@@ -177,10 +190,20 @@ namespace secplus1 {
         // (same scheduler key replaces the prior one).
         const bool correction_pending = this->maybe_door_state != this->door_state;
         const bool watching_command = this->watched_door_action_ != DoorAction::UNKNOWN;
-        uint32_t next_ms = (this->door_state == DoorState::UNKNOWN || this->flags_.door_moving || correction_pending || watching_command)
+        if (this->door_suspect_ && millis() - this->door_suspect_since_ >= DOOR_STATUS_SUSPECT_WINDOW) {
+            this->door_suspect_ = false;
+        }
+        uint32_t next_ms = (this->door_state == DoorState::UNKNOWN || this->flags_.door_moving || correction_pending || watching_command || this->door_suspect_)
             ? DOOR_STATUS_FAST_INTERVAL
-            : 10000;
+            : DOOR_STATUS_IDLE_INTERVAL;
         this->schedule_door_status_probe_(next_ms);
+    }
+
+    void Secplus1::note_door_suspect_()
+    {
+        this->door_suspect_ = true;
+        this->door_suspect_since_ = millis();
+        this->schedule_door_status_probe_(DOOR_STATUS_FAST_INTERVAL);
     }
 
     void Secplus1::wall_panel_emulation(size_t index)
@@ -315,7 +338,8 @@ namespace secplus1 {
             this->door_command_retries_,
             this->door_command_retry_failures_,
             this->door_command_unverified_,
-            this->door_command_duplicates_suppressed_ });
+            this->door_command_duplicates_suppressed_,
+            this->tx_echo_errors_ });
     }
 
     void Secplus1::clear_door_command_watch_()
@@ -761,8 +785,63 @@ namespace secplus1 {
         return { };
     }
 
+    void Secplus1::check_tx_echo_()
+    {
+        if (!this->uart_.available()) {
+            if (millis() - this->last_tx_ > TX_ECHO_TIMEOUT) {
+                this->tx_echo_pending_ = false;
+                ESP_LOGD(TAG, "[%" PRIu32 "] No echo of sent byte [%02X]", millis(), this->tx_echo_expected_);
+            }
+            return;
+        }
+        // Queries are sent with RX enabled, so the first byte read afterwards
+        // is our own. It is never a command from a wall panel, whatever it
+        // decodes as.
+        uint8_t echo = this->uart_.read();
+        this->last_rx_ = millis();
+        this->tx_echo_pending_ = false;
+        // Anything half-read before we transmitted is stale.
+        this->flags_.rx_reading_msg = false;
+        this->rx_byte_count_ = 0;
+        if (echo == this->tx_echo_expected_) {
+            {
+                char hex[format_hex_pretty_size(1)];
+                ESP_LOG2(TAG, "[%" PRIu32 "] Received byte: [%s]", millis(), format_hex_pretty_to(hex, &echo, 1));
+            }
+            this->rx_packet_[this->rx_byte_count_++] = echo;
+            this->flags_.rx_reading_msg = true;
+            return;
+        }
+
+        // The bus did not carry what we sent (another transmitter overlapped
+        // it, or a bit edge went out late). The opener received the same
+        // corrupted byte, so no usable reply follows.
+#ifdef USE_ESP8266
+        const char* parity = this->uart_.readParity() == RatgdoUART::parityEven(echo) ? "ok" : "bad";
+#else
+        const char* parity = "n/a";
+#endif
+        if (echo == 0x37 || (echo >= 0x30 && echo <= 0x35)) {
+            // A one-byte panel command. Read back as 0x30 this is a door
+            // press, and the opener may act on it: do not report it as a
+            // wall-panel button, count it, and watch the door.
+            ++this->tx_echo_errors_;
+            ESP_LOGW(TAG, "[%" PRIu32 "] Sent [%02X] but the bus read back [%02X] (parity %s, rx_gap=%" PRIu32 "); the opener may act on it. Count=%" PRIu32,
+                millis(), this->tx_echo_expected_, echo, parity, this->tx_echo_rx_gap_, this->tx_echo_errors_);
+            this->publish_door_command_stats_();
+            this->note_door_suspect_();
+        } else {
+            ESP_LOGD(TAG, "[%" PRIu32 "] Sent [%02X] but the bus read back [%02X] (parity %s, rx_gap=%" PRIu32 ")",
+                millis(), this->tx_echo_expected_, echo, parity, this->tx_echo_rx_gap_);
+        }
+        this->note_door_press_gate_reply_(false);
+    }
+
     optional<RxCommand> Secplus1::read_command()
     {
+        if (this->tx_echo_pending_) {
+            this->check_tx_echo_();
+        }
         if (!this->flags_.rx_reading_msg) {
             while (this->uart_.available()) {
                 uint8_t ser_byte = this->uart_.read();
@@ -770,7 +849,11 @@ namespace secplus1 {
 
                 if (ser_byte < 0x30 || ser_byte > 0x3A) {
                     char hex[format_hex_pretty_size(1)];
+#if RATGDO_SECPLUS1_DIAGNOSTICS
+                    ESP_LOGD(TAG, "[%" PRIu32 "] RX ignored: [%s] tx_age=%" PRIu32, millis(), format_hex_pretty_to(hex, &ser_byte, 1), millis() - this->last_tx_);
+#else
                     ESP_LOG2(TAG, "[%" PRIu32 "] Ignoring byte [%s], baud: %d", millis(), format_hex_pretty_to(hex, &ser_byte, 1), this->uart_.baudRate());
+#endif
                     this->rx_byte_count_ = 0;
                     continue;
                 }
@@ -1005,6 +1088,9 @@ namespace secplus1 {
             }
         } else if (cmd.req == CommandType::TOGGLE_DOOR_PRESS) {
             this->ratgdo_->received(ButtonState::PRESSED);
+            // A wall-panel press moves the door; report it without waiting
+            // for the next idle probe.
+            this->note_door_suspect_();
         } else if (cmd.req == CommandType::TOGGLE_DOOR_RELEASE) {
             this->ratgdo_->received(ButtonState::RELEASED);
         }
@@ -1099,8 +1185,8 @@ namespace secplus1 {
     {
 #if RATGDO_SECPLUS1_DIAGNOSTICS
         const auto previous_tx = this->last_tx_;
-        const auto previous_rx = this->last_rx_;
 #endif
+        const auto previous_rx = this->last_rx_;
         bool enable_rx = (value == 0x38) || (value == 0x39) || (value == 0x3A);
         if (!enable_rx) {
             this->uart_.enableIntTx(false);
@@ -1109,6 +1195,10 @@ namespace secplus1 {
         this->last_tx_ = millis();
         if (!enable_rx) {
             this->uart_.enableIntTx(true);
+        } else {
+            this->tx_echo_pending_ = true;
+            this->tx_echo_expected_ = static_cast<uint8_t>(value);
+            this->tx_echo_rx_gap_ = this->last_tx_ - previous_rx;
         }
         {
             uint8_t byte_val = static_cast<uint8_t>(value);

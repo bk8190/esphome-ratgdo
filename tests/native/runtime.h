@@ -97,6 +97,8 @@ namespace ratgdo {
         std::function<optional<uint8_t>(uint8_t)> respond;
         // Real hardware hears its own byte even when the opener stays silent.
         bool echo_unanswered = false;
+        // The next query reaches the bus (and reads back) as this byte instead.
+        optional<uint8_t> corrupt_next_echo;
         void begin(int, int, int, int, bool) { }
         void on_shutdown() { }
         void enableIntTx(bool) { }
@@ -111,6 +113,11 @@ namespace ratgdo {
         void write(uint8_t byte)
         {
             tx.emplace_back(millis(), byte);
+            if (corrupt_next_echo && byte >= 0x38 && byte <= 0x3A) {
+                rx.push_back(*corrupt_next_echo);
+                corrupt_next_echo.reset();
+                return;
+            }
             if (respond) {
                 auto reply = respond(byte);
                 if (reply) {

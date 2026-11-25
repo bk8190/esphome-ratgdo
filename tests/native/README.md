@@ -21,7 +21,9 @@ transmission, newer command intent, required release preservation, duplicate
 suppression, timeout cleanup, bounded warm-up queues, fast polling, confirmed
 direction changes, boot/deferred commands, passive-panel probe suppression, and
 holding a press while the opener does not answer status queries (deaf windows,
-garbled replies, the press deadline, gated retries, and direction sequences).
+garbled replies, the press deadline, gated retries, and direction sequences),
+queries that read back from the bus as another byte, the idle probe rate, and
+fast probing after a wall-panel press.
 
 These tests exercise software ordering and timing. They do not model electrical
 bus collisions, motor travel, obstruction hardware, or opener wake-up behavior.

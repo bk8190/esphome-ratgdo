@@ -141,6 +141,8 @@ struct DoorCommandStats {
     uint32_t retry_failures;
     uint32_t unverified;
     uint32_t duplicates_suppressed;
+    // Sec+1 queries that read back from the bus as a one-byte panel command.
+    uint32_t tx_echo_errors;
 };
 
 } // namespace esphome::ratgdo

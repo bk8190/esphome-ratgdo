@@ -149,6 +149,7 @@ public:
     single_observable<uint32_t> door_command_retry_failures { 0 };
     single_observable<uint32_t> door_command_unverified { 0 };
     single_observable<uint32_t> door_command_suppressed { 0 };
+    single_observable<uint32_t> door_tx_echo_errors { 0 };
 
     observable<DoorState, RATGDO_MAX_DOOR_STATE_SUBSCRIBERS> door_state { DoorState::UNKNOWN };
     observable<float, RATGDO_MAX_DOOR_STATE_SUBSCRIBERS> door_position { DOOR_POSITION_UNKNOWN };
@@ -377,6 +378,8 @@ public:
     template <typename F>
     void subscribe_door_command_suppressed(F&& f);
     template <typename F>
+    void subscribe_door_tx_echo_errors(F&& f);
+    template <typename F>
     void subscribe_door_state(F&& f);
     template <typename F>
     void subscribe_light_state(F&& f);
@@ -532,6 +535,7 @@ namespace scheduler_ids {
         DEFER_DOOR_COMMAND_RETRY_FAILURES,
         DEFER_DOOR_COMMAND_UNVERIFIED,
         DEFER_DOOR_COMMAND_SUPPRESSED,
+        DEFER_DOOR_TX_ECHO_ERRORS,
         DEFER_LIGHT_STATE,
         DEFER_LOCK_STATE,
         DEFER_OBSTRUCTION_STATE,
@@ -686,6 +690,14 @@ void RATGDOComponent::subscribe_door_command_suppressed(F&& f)
 {
     this->door_command_suppressed.subscribe([this, f](uint32_t state) {
         defer(scheduler_ids::DEFER_DOOR_COMMAND_SUPPRESSED, [f, state] { f(state); });
+    });
+}
+
+template <typename F>
+void RATGDOComponent::subscribe_door_tx_echo_errors(F&& f)
+{
+    this->door_tx_echo_errors.subscribe([this, f](uint32_t state) {
+        defer(scheduler_ids::DEFER_DOOR_TX_ECHO_ERRORS, [f, state] { f(state); });
     });
 }
 

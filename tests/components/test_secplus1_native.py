@@ -182,6 +182,11 @@ def native_runner(tmp_path_factory, request):
         "gated_retry_outlasts_watch",
         "gated_direction_sequence_keeps_callback",
         "cancel_drops_gated_press",
+        "echo_read_as_press",
+        "echo_garbage_dropped",
+        "echo_lost_then_reply",
+        "idle_probe_is_slow",
+        "wall_press_probes_fast",
     ],
 )
 def test_secplus1_scenario(native_runner, scenario):

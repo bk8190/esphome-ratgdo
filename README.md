@@ -51,6 +51,16 @@ ESP8266 boards continue to use the Arduino framework as ESPHome requires it on t
 
 ## Troubleshooting
 
+### Security+ 1.0 query read back as a command
+
+On Security+ 1.0, ratgdo checks that each status query it sends reads back from
+the bus unchanged. A query that reads back as a one-byte wall-panel command is
+logged as a warning and counted by the `Door Query Read Back As Command` sensor
+(`type: door_tx_echo_errors`). The opener received the same byte, so if it read
+back as `0x30` the door may have moved. Such a byte is never reported as a
+wall-panel button press. To limit how often this can happen, a settled door is
+queried every 5 minutes.
+
 ### Security+ 1.0 packet diagnostics
 
 Additional packet, state-confirmation, transmit-queue, and timing logs are disabled

@@ -137,6 +137,11 @@ namespace secplus1 {
         // overhear a passive poll that may never come.
         void door_status_probe_();
         void schedule_door_status_probe_(uint32_t delay);
+        // Something on the bus suggests the door may be about to move without
+        // a command from us: probe fast for a short window.
+        void note_door_suspect_();
+        // Compare the first byte read after a query with the byte we sent.
+        void check_tx_echo_();
 
         optional<RxCommand> read_command();
         void handle_command(const RxCommand& cmd);
@@ -205,6 +210,10 @@ namespace secplus1 {
         uint32_t door_command_unverified_ { 0 };
         uint32_t door_command_duplicates_suppressed_ { 0 };
         uint32_t door_press_gate_started_ { 0 };
+        // Queries whose echo read back as a one-byte panel command (a press).
+        uint32_t tx_echo_errors_ { 0 };
+        uint32_t tx_echo_rx_gap_ { 0 };
+        uint32_t door_suspect_since_ { 0 };
 
         // Larger structures
         std::priority_queue<TxCommand, std::vector<TxCommand>, FirstToSend> pending_tx_;
@@ -233,6 +242,10 @@ namespace secplus1 {
         bool door_press_gate_active_ { false };
         // A gated query was sent and its reply has not been seen yet.
         bool door_press_gate_awaiting_ { false };
+        // A query was sent with RX enabled; the next byte read is its echo.
+        bool tx_echo_pending_ { false };
+        uint8_t tx_echo_expected_ { 0 };
+        bool door_suspect_ { false };
         struct {
             uint8_t door_moving : 1;
             uint8_t wall_panel_starting : 1;
