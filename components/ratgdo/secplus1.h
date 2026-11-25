@@ -157,6 +157,10 @@ namespace secplus1 {
         bool do_transmit_if_pending();
         void enqueue_command_pair(CommandType cmd);
         void transmit_byte(uint32_t value);
+        // Checked sender for queries (RATGDO_SECPLUS1_CHECKED_QUERY_TX).
+        void transmit_query_checked_(uint8_t value, int8_t spoil_from_data_bit = -1);
+        // Supervised hardware test (RATGDO_SECPLUS1_SPOIL_TEST).
+        void spoil_test_step_();
 
         void toggle_light();
         void toggle_lock();
@@ -213,6 +217,8 @@ namespace secplus1 {
         // Queries whose echo read back as a one-byte panel command (a press).
         uint32_t tx_echo_errors_ { 0 };
         uint32_t tx_echo_rx_gap_ { 0 };
+        // Queries the checked sender did not deliver (bus busy, or spoiled).
+        uint32_t tx_query_aborts_ { 0 };
         uint32_t door_suspect_since_ { 0 };
 
         // Larger structures
@@ -246,6 +252,9 @@ namespace secplus1 {
         bool tx_echo_pending_ { false };
         uint8_t tx_echo_expected_ { 0 };
         bool door_suspect_ { false };
+        // The query being sent is already the one retry of an aborted query.
+        bool tx_query_retried_ { false };
+        uint8_t spoil_test_remaining_ { 0 };
         struct {
             uint8_t door_moving : 1;
             uint8_t wall_panel_starting : 1;

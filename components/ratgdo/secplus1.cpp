@@ -17,6 +17,27 @@
 #define RATGDO_SECPLUS1_DIAGNOSTICS 0
 #endif
 
+// Opt-in: send status queries with the checked bit-level sender in
+// secplus1_query_tx.h, which cannot put a panel command on the bus.
+#ifndef RATGDO_SECPLUS1_CHECKED_QUERY_TX
+#define RATGDO_SECPLUS1_CHECKED_QUERY_TX 0
+#endif
+#if RATGDO_SECPLUS1_CHECKED_QUERY_TX && defined(USE_ESP32)
+#error "RATGDO_SECPLUS1_CHECKED_QUERY_TX needs the bit-banged ESP8266 UART"
+#endif
+// How often a settled door is re-checked when no panel supplies its status.
+#ifndef RATGDO_SECPLUS1_IDLE_PROBE_MS
+#define RATGDO_SECPLUS1_IDLE_PROBE_MS 300000
+#endif
+// Supervised hardware test only: the Query status button sends a burst of
+// deliberately spoiled queries, to confirm the opener ignores them.
+#ifndef RATGDO_SECPLUS1_SPOIL_TEST
+#define RATGDO_SECPLUS1_SPOIL_TEST 0
+#endif
+#if RATGDO_SECPLUS1_SPOIL_TEST && !RATGDO_SECPLUS1_CHECKED_QUERY_TX
+#error "RATGDO_SECPLUS1_SPOIL_TEST needs RATGDO_SECPLUS1_CHECKED_QUERY_TX"
+#endif
+
 namespace esphome::ratgdo {
 namespace secplus1 {
 
@@ -65,8 +86,13 @@ namespace secplus1 {
     // 0x38 queries reading back as 0x30, a door press, with the door then
     // moving. Exposure scales with the query count, so a settled door is only
     // re-checked this often (it was 10s). This bounds how long an operation
-    // ratgdo cannot see (RF remote, mechanical) stays unreported.
-    static constexpr uint32_t DOOR_STATUS_IDLE_INTERVAL = 300000;
+    // ratgdo cannot see (RF remote, mechanical) stays unreported. The checked
+    // query sender removes that exposure and can use a short interval again.
+    static constexpr uint32_t DOOR_STATUS_IDLE_INTERVAL = RATGDO_SECPLUS1_IDLE_PROBE_MS;
+    // An aborted checked query is sent again once, this much later.
+    static constexpr uint32_t QUERY_RETRY_DELAY = 300;
+    static constexpr uint8_t SPOIL_TEST_FRAMES = 30;
+    static constexpr uint32_t SPOIL_TEST_INTERVAL = 300;
     // After a hint that the door may be about to move (a wall-panel press, or
     // one of our queries read back as a press), probe fast for this long so
     // the movement is reported promptly despite the slow idle rate.
@@ -339,7 +365,8 @@ namespace secplus1 {
             this->door_command_retry_failures_,
             this->door_command_unverified_,
             this->door_command_duplicates_suppressed_,
-            this->tx_echo_errors_ });
+            this->tx_echo_errors_,
+            this->tx_query_aborts_ });
     }
 
     void Secplus1::clear_door_command_watch_()
@@ -775,6 +802,11 @@ namespace secplus1 {
     Result Secplus1::call(Args args)
     {
         if (args.tag == Args::Tag::query_status) {
+#if RATGDO_SECPLUS1_SPOIL_TEST
+            this->spoil_test_remaining_ = SPOIL_TEST_FRAMES;
+            this->spoil_test_step_();
+            return { };
+#endif
             this->enqueue_transmit(CommandType::QUERY_DOOR_STATUS);
             // Second QUERY_DOOR_STATUS 2.5s later so the two-confirmation gate
             // can commit state from a single manual query-status press.
@@ -1188,6 +1220,12 @@ namespace secplus1 {
 #endif
         const auto previous_rx = this->last_rx_;
         bool enable_rx = (value == 0x38) || (value == 0x39) || (value == 0x3A);
+#if RATGDO_SECPLUS1_CHECKED_QUERY_TX
+        if (enable_rx) {
+            this->transmit_query_checked_(static_cast<uint8_t>(value));
+            return;
+        }
+#endif
         if (!enable_rx) {
             this->uart_.enableIntTx(false);
         }
@@ -1212,6 +1250,77 @@ namespace secplus1 {
 #endif
         }
     }
+
+#if RATGDO_SECPLUS1_CHECKED_QUERY_TX
+    void Secplus1::transmit_query_checked_(uint8_t value, int8_t spoil_from_data_bit)
+    {
+        const auto previous_tx = this->last_tx_;
+        const auto previous_rx = this->last_rx_;
+        QueryTxInfo info;
+        const auto result = this->uart_.send_query_checked(value, &info, spoil_from_data_bit);
+        this->last_tx_ = millis();
+        // Interrupts were off for the frame, so none of it was received.
+        // Anything half-read before it is stale.
+        this->flags_.rx_reading_msg = false;
+        this->rx_byte_count_ = 0;
+        if (result == QueryTxResult::SENT) {
+            // The bus was verified bit by bit: stand in for the echo, so the
+            // opener's reply completes the packet as before.
+            this->rx_packet_[this->rx_byte_count_++] = value;
+            this->flags_.rx_reading_msg = true;
+            this->last_rx_ = this->last_tx_;
+            this->tx_query_retried_ = false;
+#if RATGDO_SECPLUS1_DIAGNOSTICS
+            ESP_LOGD(TAG, "[%" PRIu32 "] Sent byte: [%02X] tx_gap=%" PRIu32 " rx_gap=%" PRIu32 " rise=%uus late=%uus queued=%u",
+                millis(), value, this->last_tx_ - previous_tx, this->last_tx_ - previous_rx,
+                info.rise_us, info.late_us, static_cast<unsigned>(this->pending_tx_.size()));
+#else
+            ESP_LOGD(TAG, "[%" PRIu32 "] Sent byte: [%02X]", millis(), value);
+#endif
+            return;
+        }
+
+        ++this->tx_query_aborts_;
+        ESP_LOGD(TAG, "[%" PRIu32 "] Query [%02X] %s (bit %d, rise=%uus late=%uus, tx_gap=%" PRIu32 " rx_gap=%" PRIu32 "). Count=%" PRIu32,
+            millis(), value, result == QueryTxResult::BUSY ? "not sent, bus busy" : "spoiled", info.spoiled_at,
+            info.rise_us, info.late_us, this->last_tx_ - previous_tx, this->last_tx_ - previous_rx, this->tx_query_aborts_);
+        this->publish_door_command_stats_();
+        this->note_door_press_gate_reply_(false);
+        if (spoil_from_data_bit >= 0) {
+            return; // deliberate, from the hardware test
+        }
+        // Send it again once. A second failure waits for the next probe, so a
+        // line that is stuck cannot turn this into a stream of frames.
+        if (this->tx_query_retried_) {
+            this->tx_query_retried_ = false;
+        } else {
+            this->tx_query_retried_ = true;
+            this->enqueue_transmit(to_CommandType(value, CommandType::QUERY_DOOR_STATUS), millis() + QUERY_RETRY_DELAY);
+        }
+    }
+#endif
+
+#if RATGDO_SECPLUS1_SPOIL_TEST
+    void Secplus1::spoil_test_step_()
+    {
+        if (this->spoil_test_remaining_ == 0) {
+            ESP_LOGI(TAG, "Spoil test finished; querying door status");
+            this->enqueue_transmit(CommandType::QUERY_DOOR_STATUS, millis() + 500);
+            this->enqueue_transmit(CommandType::QUERY_DOOR_STATUS, millis() + 3000);
+            return;
+        }
+        if (this->pending_tx_.empty() && millis() - this->last_tx_ > 200 && millis() - this->last_rx_ > 50) {
+            // Data bits 3, 4 and 5 are the ones a 0x38 releases.
+            const int8_t data_bit = 3 + (this->spoil_test_remaining_ % 3);
+            --this->spoil_test_remaining_;
+            ESP_LOGI(TAG, "Spoil test: 0x38 spoiled at data bit %d, %u left", data_bit, this->spoil_test_remaining_);
+            this->transmit_query_checked_(static_cast<uint8_t>(CommandType::QUERY_DOOR_STATUS), data_bit);
+        }
+        this->scheduler_->set_timeout(this->ratgdo_, TIMEOUT_SPOIL_TEST, SPOIL_TEST_INTERVAL, [this] {
+            this->spoil_test_step_();
+        });
+    }
+#endif
 
 } // namespace secplus1
 } // namespace esphome::ratgdo

@@ -848,6 +848,43 @@ void wall_press_probes_fast()
     CHECK(rig.sent(0x38) - queries <= 6); // fast window ends, back to idle
 }
 
+#if RATGDO_SECPLUS1_CHECKED_QUERY_TX
+// An aborted query is sent again once, then left to the next probe.
+void checked_abort_retries_once()
+{
+    Rig rig;
+    rig.protocol.uart_.abort_queries = 1;
+    rig.protocol.door_status_probe_();
+    rig.run(1000);
+    CHECK(rig.protocol.uart_.aborted == 1);
+    CHECK(rig.sent(0x38) == 1);
+    CHECK(rig.component.stats.tx_query_aborts == 1);
+    CHECK(*rig.component.door_state == DoorState::CLOSED);
+
+    rig.protocol.uart_.abort_queries = 5;
+    rig.protocol.door_status_probe_();
+    rig.run(5000);
+    CHECK(rig.protocol.uart_.aborted == 3); // the query and its one retry
+    CHECK(rig.sent(0x38) == 1);
+    CHECK(rig.component.stats.tx_query_aborts == 3);
+}
+
+// With the echo stood in for, an unanswered query still times out and a
+// real wall-panel press arriving afterwards is still reported.
+void checked_unanswered_then_wall_press()
+{
+    Rig rig;
+    rig.drop_queries = true;
+    rig.protocol.door_status_probe_();
+    rig.run(500);
+    CHECK(rig.sent(0x38) == 1);
+    rig.protocol.uart_.rx.push_back(0x30);
+    rig.run(100);
+    CHECK(rig.component.button_presses == 1);
+    CHECK(rig.component.stats.tx_echo_errors == 0);
+}
+#endif
+
 int main(int argc, char** argv)
 {
     const std::map<std::string, void (*)()> scenarios = {
@@ -896,9 +933,14 @@ int main(int argc, char** argv)
         { "gated_retry_outlasts_watch", gated_retry_outlasts_watch },
         { "gated_direction_sequence_keeps_callback", gated_direction_sequence_keeps_callback },
         { "cancel_drops_gated_press", cancel_drops_gated_press },
+#if RATGDO_SECPLUS1_CHECKED_QUERY_TX
+        { "checked_abort_retries_once", checked_abort_retries_once },
+        { "checked_unanswered_then_wall_press", checked_unanswered_then_wall_press },
+#else
         { "echo_read_as_press", echo_read_as_press },
         { "echo_garbage_dropped", echo_garbage_dropped },
         { "echo_lost_then_reply", echo_lost_then_reply },
+#endif
         { "idle_probe_is_slow", idle_probe_is_slow },
         { "wall_press_probes_fast", wall_press_probes_fast },
     };

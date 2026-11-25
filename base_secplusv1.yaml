@@ -73,6 +73,13 @@ sensor:
     name: "Door Query Read Back As Command"
     state_class: total_increasing
     icon: mdi:alert-octagon-outline
+  - platform: ratgdo
+    id: ${id_prefix}_door_tx_query_aborts
+    type: door_tx_query_aborts
+    entity_category: diagnostic
+    name: "Door Queries Aborted"
+    state_class: total_increasing
+    icon: mdi:close-octagon-outline
 
 ota:
   - platform: esphome

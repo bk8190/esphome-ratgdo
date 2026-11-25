@@ -29,10 +29,19 @@ def function_definition(source: str, pattern: str) -> str:
     return source[match.start() : end]
 
 
+# (packet diagnostics, checked query sender)
 @pytest.fixture(
-    scope="session", params=[0, 1], ids=["diagnostics_off", "diagnostics_on"]
+    scope="session",
+    params=[(0, 0), (1, 0), (0, 1), (1, 1)],
+    ids=[
+        "diagnostics_off",
+        "diagnostics_on",
+        "checked_tx",
+        "checked_tx_diagnostics",
+    ],
 )
 def native_runner(tmp_path_factory, request):
+    diagnostics, checked_tx = request.param
     compiler = shutil.which("g++")
     assert compiler, "Native firmware tests require g++"
     build = tmp_path_factory.mktemp("secplus1-native")
@@ -110,7 +119,8 @@ def native_runner(tmp_path_factory, request):
             "-fsanitize=undefined",
             "-fno-sanitize-recover=all",
             "-DPROTOCOL_SECPLUSV1",
-            f"-DRATGDO_SECPLUS1_DIAGNOSTICS={request.param}",
+            f"-DRATGDO_SECPLUS1_DIAGNOSTICS={diagnostics}",
+            f"-DRATGDO_SECPLUS1_CHECKED_QUERY_TX={checked_tx}",
             "-include",
             str(NATIVE / "runtime.h"),
             "-I",
@@ -131,7 +141,7 @@ def native_runner(tmp_path_factory, request):
         text=True,
     )
     assert result.returncode == 0, result.stdout + result.stderr
-    return executable
+    return executable, bool(checked_tx)
 
 
 @pytest.mark.parametrize(
@@ -185,12 +195,18 @@ def native_runner(tmp_path_factory, request):
         "echo_read_as_press",
         "echo_garbage_dropped",
         "echo_lost_then_reply",
+        "checked_abort_retries_once",
+        "checked_unanswered_then_wall_press",
         "idle_probe_is_slow",
         "wall_press_probes_fast",
     ],
 )
 def test_secplus1_scenario(native_runner, scenario):
+    executable, checked_tx = native_runner
+    # The echo check and the checked sender replace each other.
+    if scenario.startswith("checked_" if not checked_tx else "echo_"):
+        pytest.skip("not built in this configuration")
     result = subprocess.run(
-        [str(native_runner), scenario], capture_output=True, text=True, check=False
+        [str(executable), scenario], capture_output=True, text=True, check=False
     )
     assert result.returncode == 0, result.stdout + result.stderr

@@ -10,6 +10,8 @@
 #include <utility>
 #include <vector>
 
+#include "secplus1_query_tx.h"
+
 #define PROGMEM
 #define RATGDO_UART_8E1 0
 #define RATGDO_MAX_DOOR_STATE_SUBSCRIBERS 1
@@ -109,6 +111,26 @@ namespace ratgdo {
             auto byte = rx.front();
             rx.pop_front();
             return byte;
+        }
+        // Checked sender stand-in: the opener's reply is received, our own
+        // byte is not. The next `abort_queries` queries are not delivered.
+        int abort_queries = 0;
+        int aborted = 0;
+        secplus1::QueryTxResult send_query_checked(uint8_t byte, secplus1::QueryTxInfo* = nullptr, int8_t spoil_from_data_bit = -1)
+        {
+            if (abort_queries > 0 || spoil_from_data_bit >= 0) {
+                abort_queries -= abort_queries > 0;
+                ++aborted;
+                return secplus1::QueryTxResult::SPOILED;
+            }
+            tx.emplace_back(millis(), byte);
+            if (respond) {
+                auto reply = respond(byte);
+                if (reply) {
+                    rx.push_back(*reply);
+                }
+            }
+            return secplus1::QueryTxResult::SENT;
         }
         void write(uint8_t byte)
         {

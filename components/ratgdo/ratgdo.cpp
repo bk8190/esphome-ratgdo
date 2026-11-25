@@ -449,6 +449,7 @@ void RATGDOComponent::received(const DoorCommandStats stats)
     this->door_command_unverified = stats.unverified;
     this->door_command_suppressed = stats.duplicates_suppressed;
     this->door_tx_echo_errors = stats.tx_echo_errors;
+    this->door_tx_query_aborts = stats.tx_query_aborts;
 }
 
 void RATGDOComponent::received(const BatteryState battery_state)

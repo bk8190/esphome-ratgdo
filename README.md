@@ -61,6 +61,33 @@ back as `0x30` the door may have moved. Such a byte is never reported as a
 wall-panel button press. To limit how often this can happen, a settled door is
 queried every 5 minutes.
 
+### Security+ 1.0 checked query sender (ESP8266, opt-in)
+
+A status query (`0x38`) differs from a door press (`0x30`) in one bit, and the
+bus is wired-AND, so a short low pulse on that bit turns a query into a press.
+With `-DRATGDO_SECPLUS1_CHECKED_QUERY_TX=1`, ratgdo sends queries bit by bit
+with interrupts off and reads the bus back while it releases each data bit. If
+the bus is low when it should be high, or an edge goes out late, it holds the
+line low through the stop bit so the frame is invalid. Such a query is counted
+by the `Door Queries Aborted` sensor (`type: door_tx_query_aborts`) and sent
+again once.
+
+```yaml
+esphome:
+  platformio_options:
+    build_flags:
+      - -DRATGDO_SECPLUS1_CHECKED_QUERY_TX=1
+      - -DRATGDO_SECPLUS1_IDLE_PROBE_MS=10000
+```
+
+`RATGDO_SECPLUS1_IDLE_PROBE_MS` sets how often a settled door is queried
+(default 300000). The sender assumes the bus reads idle within 250 µs of being
+released; diagnostics builds log the measured time as `rise=`.
+
+`-DRATGDO_SECPLUS1_SPOIL_TEST=1` is for a supervised hardware test only. The
+Query status button then sends 30 deliberately invalid queries, to confirm
+that the opener ignores them. Do not leave it flashed.
+
 ### Security+ 1.0 packet diagnostics
 
 Additional packet, state-confirmation, transmit-queue, and timing logs are disabled

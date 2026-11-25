@@ -143,6 +143,8 @@ struct DoorCommandStats {
     uint32_t duplicates_suppressed;
     // Sec+1 queries that read back from the bus as a one-byte panel command.
     uint32_t tx_echo_errors;
+    // Sec+1 queries the checked sender did not deliver.
+    uint32_t tx_query_aborts;
 };
 
 } // namespace esphome::ratgdo

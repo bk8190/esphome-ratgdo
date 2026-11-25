@@ -25,7 +25,15 @@ garbled replies, the press deadline, gated retries, and direction sequences),
 queries that read back from the bus as another byte, the idle probe rate, and
 fast probing after a wall-panel press.
 
-These tests exercise software ordering and timing. They do not model electrical
-bus collisions, motor travel, obstruction hardware, or opener wake-up behavior.
+`python -m pytest tests/components/test_secplus1_query_tx.py -v` runs the
+checked query sender (`secplus1_query_tx.h`) against a simulated wired-AND line
+and a simulated opener UART. It sweeps interfering pulses and timing stalls
+across the frame and asserts the opener never decodes a panel command. The
+scenario suite above also runs with the checked sender enabled.
+
+These tests exercise software ordering and timing. Apart from that line model,
+they do not model electrical bus behavior, motor travel, obstruction hardware,
+or opener wake-up behavior. The real bus's rise time and the real opener's
+handling of an invalid frame are not established here.
 Firmware builds and operator-supervised board tests remain necessary before
 hardware deployment or marking an upstream PR ready.

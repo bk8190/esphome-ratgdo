@@ -71,6 +71,12 @@ void RATGDOSensor::setup()
             this->publish_state(value);
         });
         break;
+    case RATGDOSensorType::RATGDO_DOOR_TX_QUERY_ABORTS:
+        this->publish_state(0);
+        this->parent_->subscribe_door_tx_query_aborts([this](uint32_t value) {
+            this->publish_state(value);
+        });
+        break;
     case RATGDOSensorType::RATGDO_DISTANCE:
 #ifdef RATGDO_USE_DISTANCE_SENSOR
         this->distance_sensor_.setI2cDevice(&I2C);
@@ -133,6 +139,9 @@ void RATGDOSensor::dump_config()
         break;
     case RATGDOSensorType::RATGDO_DOOR_TX_ECHO_ERRORS:
         ESP_LOGCONFIG(TAG, "  Type: Door TX Echo Errors");
+        break;
+    case RATGDOSensorType::RATGDO_DOOR_TX_QUERY_ABORTS:
+        ESP_LOGCONFIG(TAG, "  Type: Door TX Query Aborts");
         break;
     case RATGDOSensorType::RATGDO_DISTANCE:
         ESP_LOGCONFIG(TAG, "  Type: Distance");

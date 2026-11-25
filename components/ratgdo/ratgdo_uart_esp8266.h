@@ -9,6 +9,8 @@
 #include "esphome/core/application.h"
 #include "esphome/core/hal.h"
 
+#include "secplus1_query_tx.h"
+
 namespace esphome::ratgdo {
 
 // Placed in IRAM because plerup's rxBitISR may fire during flash writes.
@@ -31,6 +33,7 @@ public:
     {
         this->rx_pin_ = rxPin;
         this->tx_pin_ = txPin;
+        this->invert_ = invert;
         SoftwareSerial::begin(baud, static_cast<Config>(config), rxPin, txPin, invert);
         // Wake the main loop on incoming bytes instead of polling each tick.
         this->onReceive(ratgdo_wake_main_loop_from_isr);
@@ -44,6 +47,27 @@ public:
         if (this->rx_pin_ >= 0) {
             ::pinMode(this->rx_pin_, INPUT);
         }
+    }
+
+    // Send one Security+ 1.0 query bit by bit with interrupts off, reading the
+    // bus back while it is released. See secplus1_query_tx.h. Nothing of the
+    // frame is received through SoftwareSerial; the caller stands in for the
+    // echo when the result is SENT.
+    secplus1::QueryTxResult send_query_checked(uint8_t byte, secplus1::QueryTxInfo* info = nullptr, int8_t spoil_from_data_bit = -1)
+    {
+        struct Bus {
+            uint8_t tx;
+            uint8_t rx;
+            bool invert;
+            uint32_t micros() { return ::micros(); }
+            // Inverted: a high pin pulls the bus low.
+            void drive(bool low) { ::digitalWrite(tx, low == invert ? HIGH : LOW); }
+            bool low() { return (::digitalRead(rx) == HIGH) == invert; }
+        } bus { static_cast<uint8_t>(this->tx_pin_), static_cast<uint8_t>(this->rx_pin_), this->invert_ };
+        const uint32_t saved = xt_rsil(15);
+        const auto result = secplus1::send_query_checked(bus, byte, info, spoil_from_data_bit);
+        xt_wsr_ps(saved);
+        return result;
     }
 
     // Fallback for SECPLUS2 preamble on ESP8266
@@ -60,6 +84,7 @@ public:
 private:
     int8_t rx_pin_ { -1 };
     int8_t tx_pin_ { -1 };
+    bool invert_ { false };
 };
 
 } // namespace esphome::ratgdo
