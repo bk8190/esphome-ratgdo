@@ -1336,10 +1336,56 @@ namespace secplus1 {
         // The bus with nothing sent.
         auto count = this->uart_.scope_capture(400000, edges, 160);
         log_edges("idle", 400, count);
-        // One status query, then what follows it.
+        // One status query, then what follows it, long enough to see when
+        // the periodic pulses come back.
         this->transmit_byte(static_cast<uint8_t>(CommandType::QUERY_DOOR_STATUS));
-        count = this->uart_.scope_capture(250000, edges, 160);
-        log_edges("after 0x38", 250, count);
+        count = this->uart_.scope_capture(1500000, edges, 160);
+        log_edges("after 0x38", 1500, count);
+        this->phase_test_trial_ = 0;
+        this->scheduler_->set_timeout(this->ratgdo_, TIMEOUT_ABORT_TEST, 3000, [this] {
+            this->phase_test_step_();
+        });
+    }
+
+    // Which start times, relative to the bus's periodic pulse, does the
+    // opener answer? Send 0x38 at a set delay after a pulse ends and record
+    // what follows.
+    void Secplus1::phase_test_step_()
+    {
+        static const uint16_t delays[] = { 300, 1500, 3000, 4500, 6000, 7500, 9000, 10000, 11000, 11700 };
+        static constexpr uint8_t REPEATS = 4;
+        static uint32_t edges[40];
+        const uint8_t trial = this->phase_test_trial_;
+        if (trial >= REPEATS * (sizeof(delays) / sizeof(delays[0]))) {
+            ESP_LOGI(TAG, "Phase test finished");
+            return;
+        }
+        if (this->pending_tx_.empty() && millis() - this->last_tx_ > 200 && millis() - this->last_rx_ > 50 && !this->flags_.rx_reading_msg) {
+            ++this->phase_test_trial_;
+            const uint16_t delay_us = delays[trial % (sizeof(delays) / sizeof(delays[0]))];
+            uint32_t rise_at = 0, width = 0;
+            const bool pulse = this->uart_.wait_pulse_end(40000, &rise_at, &width);
+            if (pulse) {
+                while (micros() - rise_at < delay_us) {
+                }
+            }
+            const uint32_t sent_at = micros();
+            this->uart_.write(static_cast<uint8_t>(CommandType::QUERY_DOOR_STATUS));
+            this->last_tx_ = millis();
+            const uint32_t capture_at = micros();
+            const auto count = this->uart_.scope_capture(45000, edges, 40);
+            char line[200];
+            size_t used = 0;
+            for (size_t i = 0; i < count && used < sizeof(line) - 14; ++i) {
+                used += snprintf(line + used, sizeof(line) - used, " %c%" PRIu32, (edges[i] & 1) ? 'L' : 'H', edges[i] >> 1);
+            }
+            line[used] = 0;
+            ESP_LOGI(TAG, "phase trial=%u pulse=%u width=%" PRIu32 " delay=%u start_after_rise=%" PRIu32 " write_us=%" PRIu32 " edges=%u:%s",
+                trial, pulse, width, delay_us, sent_at - rise_at, capture_at - sent_at, static_cast<unsigned>(count), line);
+        }
+        this->scheduler_->set_timeout(this->ratgdo_, TIMEOUT_ABORT_TEST, 1500, [this] {
+            this->phase_test_step_();
+        });
     }
 #endif
 

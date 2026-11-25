@@ -161,6 +161,7 @@ namespace secplus1 {
         void transmit_query_checked_(uint8_t value, int8_t abort_at_data_bit = -1);
         // Diagnostic bus capture (RATGDO_SECPLUS1_BUS_SCOPE).
         void bus_scope_();
+        void phase_test_step_();
         // Supervised hardware test (RATGDO_SECPLUS1_ABORT_TEST).
         void abort_test_step_();
 
@@ -257,6 +258,7 @@ namespace secplus1 {
         // The query being sent is already the one retry of an aborted query.
         bool tx_query_retried_ { false };
         uint8_t abort_test_remaining_ { 0 };
+        uint8_t phase_test_trial_ { 0 };
         struct {
             uint8_t door_moving : 1;
             uint8_t wall_panel_starting : 1;

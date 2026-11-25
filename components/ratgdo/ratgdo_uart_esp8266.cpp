@@ -43,6 +43,39 @@ IRAM_ATTR secplus1::QueryTxResult RatgdoUART::send_query_checked(uint8_t byte, s
     return secplus1::send_query_checked(bus, byte, info, abort_at_data_bit);
 }
 
+IRAM_ATTR bool RatgdoUART::wait_pulse_end(uint32_t timeout_us, uint32_t* rise_at, uint32_t* width_us)
+{
+    if (this->rx_pin_ < 0 || this->rx_pin_ > 15) {
+        return false;
+    }
+    const uint32_t mask = 1U << this->rx_pin_;
+    const bool invert = this->invert_;
+    const uint32_t start = ::micros();
+    // Skip a low already in progress: its start was not seen.
+    while ((((GPI & mask) != 0) == invert)) {
+        if (::micros() - start > timeout_us) {
+            return false;
+        }
+    }
+    while (!(((GPI & mask) != 0) == invert)) {
+        if (::micros() - start > timeout_us) {
+            return false;
+        }
+    }
+    const uint32_t fell = ::micros();
+    uint32_t now = fell;
+    while ((((GPI & mask) != 0) == invert)) {
+        now = ::micros();
+        if (now - fell > 20000) {
+            break;
+        }
+    }
+    now = ::micros();
+    *rise_at = now;
+    *width_us = now - fell;
+    return true;
+}
+
 IRAM_ATTR size_t RatgdoUART::scope_capture(uint32_t duration_us, uint32_t* edges, size_t max_edges)
 {
     if (this->rx_pin_ < 0 || this->rx_pin_ > 15) {

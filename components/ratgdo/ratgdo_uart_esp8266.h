@@ -58,6 +58,11 @@ public:
     // Returns the number of entries written. Interrupts stay on.
     size_t scope_capture(uint32_t duration_us, uint32_t* edges, size_t max_edges);
 
+    // Diagnostic: wait up to timeout_us for a low pulse on the bus to end.
+    // Returns false if none is seen. Otherwise sets *rise_at to micros() at
+    // its rising edge and *width_us to how long it was low.
+    bool wait_pulse_end(uint32_t timeout_us, uint32_t* rise_at, uint32_t* width_us);
+
     // Defined in ratgdo_uart_esp8266.cpp so it can be placed in IRAM.
     secplus1::QueryTxResult send_query_checked(uint8_t byte, secplus1::QueryTxInfo* info = nullptr, int8_t abort_at_data_bit = -1);
 
