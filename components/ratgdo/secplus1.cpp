@@ -34,6 +34,12 @@
 #ifndef RATGDO_SECPLUS1_ABORT_TEST
 #define RATGDO_SECPLUS1_ABORT_TEST 0
 #endif
+// A real wall panel is known to be on the bus: never start emulating one,
+// even if the opener stays silent after boot. Emulating beside a real panel
+// puts two masters on the bus.
+#ifndef RATGDO_SECPLUS1_NO_PANEL_EMULATION
+#define RATGDO_SECPLUS1_NO_PANEL_EMULATION 0
+#endif
 #if RATGDO_SECPLUS1_ABORT_TEST && !RATGDO_SECPLUS1_CHECKED_QUERY_TX
 #error "RATGDO_SECPLUS1_ABORT_TEST needs RATGDO_SECPLUS1_CHECKED_QUERY_TX"
 #endif
@@ -245,7 +251,7 @@ namespace secplus1 {
                 ESP_LOG1(TAG, "Wall panel detected");
                 return;
             }
-            if (millis() - this->wall_panel_emulation_start_ > 35000 && !this->flags_.wall_panel_starting) {
+            if (!RATGDO_SECPLUS1_NO_PANEL_EMULATION && millis() - this->wall_panel_emulation_start_ > 35000 && !this->flags_.wall_panel_starting) {
                 ESP_LOGD(TAG, "No wall panel detected. Switching to emulation mode.");
                 this->wall_panel_emulation_state_ = WallPanelEmulationState::RUNNING;
             }
@@ -1273,9 +1279,9 @@ namespace secplus1 {
             this->last_rx_ = this->last_tx_;
             this->tx_query_retried_ = false;
 #if RATGDO_SECPLUS1_DIAGNOSTICS
-            ESP_LOGD(TAG, "[%" PRIu32 "] Sent byte: [%02X] tx_gap=%" PRIu32 " rx_gap=%" PRIu32 " rise=%uus late=%uus queued=%u",
+            ESP_LOGD(TAG, "[%" PRIu32 "] Sent byte: [%02X] tx_gap=%" PRIu32 " rx_gap=%" PRIu32 " fall=%uus rise=%uus late=%uus queued=%u",
                 millis(), value, this->last_tx_ - previous_tx, this->last_tx_ - previous_rx,
-                info.rise_us, info.late_us, static_cast<unsigned>(this->pending_tx_.size()));
+                info.fall_us, info.rise_us, info.late_us, static_cast<unsigned>(this->pending_tx_.size()));
 #else
             ESP_LOGD(TAG, "[%" PRIu32 "] Sent byte: [%02X]", millis(), value);
 #endif
@@ -1284,7 +1290,7 @@ namespace secplus1 {
 
         ++this->tx_query_aborts_;
         ESP_LOGD(TAG, "[%" PRIu32 "] Query [%02X] %s (bit %d, low=%uus rise=%uus late=%uus, tx_gap=%" PRIu32 " rx_gap=%" PRIu32 "). Count=%" PRIu32,
-            millis(), value, result == QueryTxResult::BUSY ? "not sent, bus busy" : "aborted", info.aborted_at,
+            millis(), value, result == QueryTxResult::BUSY ? "not sent, bus busy" : (info.no_drive ? "aborted, line did not go low" : "aborted"), info.aborted_at,
             info.low_us, info.rise_us, info.late_us, this->last_tx_ - previous_tx, this->last_tx_ - previous_rx, this->tx_query_aborts_);
         this->publish_door_command_stats_();
         this->note_door_press_gate_reply_(false);

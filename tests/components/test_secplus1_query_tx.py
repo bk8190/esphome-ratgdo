@@ -54,6 +54,7 @@ def query_tx_runner(tmp_path_factory):
         "stall_with_pulse_never_makes_a_command",
         "forced_abort_is_not_a_command",
         "abort_reports_pulse_width",
+        "dead_output_is_reported",
         "slow_line_is_aborted",
     ],
 )

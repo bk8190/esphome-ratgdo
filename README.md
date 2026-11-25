@@ -85,6 +85,11 @@ esphome:
 (default 300000). The sender assumes the bus reads idle within 250 µs of being
 released; diagnostics builds log the measured time as `rise=`.
 
+`-DRATGDO_SECPLUS1_NO_PANEL_EMULATION=1` stops ratgdo from ever emulating a
+wall panel. Use it where a real Security+ 1.0 panel is installed: if the opener
+is silent for 35 seconds after boot, ratgdo otherwise starts emulating one
+beside the real one.
+
 `-DRATGDO_SECPLUS1_ABORT_TEST=1` is for a supervised hardware test only. The
 Query status button then sends 30 deliberately abandoned queries, to confirm
 that the opener ignores them. Do not leave it flashed.

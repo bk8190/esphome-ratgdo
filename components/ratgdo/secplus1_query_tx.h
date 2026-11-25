@@ -26,9 +26,14 @@
 // into it (a UART samples near the middle).
 //
 // The algorithm is a template over the bus so the host tests can run it
-// against a simulated line and opener.
+// against a simulated line and opener. It is forced inline so that on the
+// ESP8266 the whole of it lands in the caller, which is placed in IRAM: code
+// run from flash stalls for hundreds of microseconds on a cache miss, enough
+// to shorten a bit.
 
 #include <cstdint>
+
+#define RATGDO_QUERY_TX_INLINE inline __attribute__((always_inline))
 
 namespace esphome::ratgdo::secplus1 {
 
@@ -41,8 +46,12 @@ enum class QueryTxResult : uint8_t {
 struct QueryTxInfo {
     // Longest time the bus took to read idle after we released it.
     uint16_t rise_us { 0 };
-    // Largest delay between a bit deadline and reaching it.
+    // Largest delay between a bit deadline and the edge having been driven.
     uint16_t late_us { 0 };
+    // How long the line took to read low after we first pulled it.
+    uint16_t fall_us { 0 };
+    // The line never read low while we pulled it: nothing reached the bus.
+    bool no_drive { false };
     // Frame bit (0 = start, 1-8 = data, 9 = parity) at which it was aborted.
     int8_t aborted_at { -1 };
     // How long the line then stayed low, up to LOW_MEASURE_CAP_US. Also set
@@ -63,6 +72,8 @@ namespace query_tx {
     // While watching a released bit, a gap this long between two looks at the
     // bus (a non-maskable interrupt) means a pulse could have been missed.
     static constexpr uint32_t BLIND_US = bit_us(1) / 8;
+    // After the start bit is driven the bus must read low within this time.
+    static constexpr uint32_t FALL_DEADLINE_US = 250;
     // After a release the bus must read idle within this time.
     static constexpr uint32_t RISE_DEADLINE_US = 250;
     // After an abort, time the low that caused it for the log, up to this.
@@ -89,14 +100,14 @@ namespace query_tx {
 // abort_at_data_bit is a test hook: abandon the frame at that data bit (0-7)
 // as if the bus had been found low there.
 template <typename Bus>
-QueryTxResult send_query_checked(Bus& bus, uint8_t byte, QueryTxInfo* info = nullptr, int8_t abort_at_data_bit = -1)
+RATGDO_QUERY_TX_INLINE QueryTxResult send_query_checked(Bus& bus, uint8_t byte, QueryTxInfo* info = nullptr, int8_t abort_at_data_bit = -1)
 {
     using namespace query_tx;
     QueryTxInfo local;
     QueryTxInfo& out = info ? *info : local;
     out = QueryTxInfo { };
 
-    const auto time_low = [&] {
+    const auto time_low = [&]() __attribute__((always_inline)) {
         const uint32_t from = bus.micros();
         uint32_t held = 0;
         while (bus.low() && held < LOW_MEASURE_CAP_US) {
@@ -117,12 +128,12 @@ QueryTxResult send_query_checked(Bus& bus, uint8_t byte, QueryTxInfo* info = nul
 
     struct Critical {
         Bus& bus;
-        explicit Critical(Bus& b)
+        RATGDO_QUERY_TX_INLINE explicit Critical(Bus& b)
             : bus(b)
         {
             bus.lock();
         }
-        ~Critical() { bus.unlock(); }
+        RATGDO_QUERY_TX_INLINE ~Critical() { bus.unlock(); }
     } critical(bus);
 
     const uint32_t listen_start = bus.micros();
@@ -135,7 +146,7 @@ QueryTxResult send_query_checked(Bus& bus, uint8_t byte, QueryTxInfo* info = nul
 
     const uint16_t frame = frame_bits(byte);
     const uint32_t t0 = bus.micros();
-    const auto abort = [&](uint8_t bit) {
+    const auto abort = [&](uint8_t bit) __attribute__((always_inline)) {
         bus.drive(false);
         time_low();
         out.aborted_at = static_cast<int8_t>(bit);
@@ -149,31 +160,55 @@ QueryTxResult send_query_checked(Bus& bus, uint8_t byte, QueryTxInfo* info = nul
         const bool released = (frame >> bit) & 1;
         const bool data = bit >= 1 && bit <= 8;
 
+        if (data && abort_at_data_bit == bit - 1) {
+            return abort(bit);
+        }
+        bus.drive(!released);
+        // Checked after the edge, so a stall just before it is caught too.
         const uint32_t late = bus.micros() - t0 - start;
         if (late > out.late_us) {
             out.late_us = static_cast<uint16_t>(late > 0xFFFF ? 0xFFFF : late);
         }
-        if (late > LATE_US || (data && abort_at_data_bit == bit - 1)) {
+        if (late > LATE_US) {
             return abort(bit);
         }
-        bus.drive(!released);
+        if (bit == 0) {
+            // The start bit must actually reach the bus.
+            uint32_t fall = 0;
+            while (!bus.low()) {
+                fall = bus.micros() - t0;
+                if (fall > FALL_DEADLINE_US) {
+                    out.no_drive = true;
+                    return abort(bit);
+                }
+            }
+            out.fall_us = static_cast<uint16_t>(fall);
+        }
 
         if (released && data) {
+            // Time of the last look at the bus that found it idle. Carried
+            // from the rise check into the watch, so a stall between the two
+            // counts as a gap.
+            uint32_t seen = start;
             if (!watching) {
-                // Just released after a driven bit: let the line rise.
-                uint32_t rise = 0;
+                // Just released after a driven bit: let the line rise. The
+                // time is taken when it is first seen idle, so a stall that
+                // hides a low still counts against the deadline.
                 while (bus.low()) {
-                    rise = bus.micros() - t0 - start;
-                    if (rise > RISE_DEADLINE_US) {
+                    if (bus.micros() - t0 - start > RISE_DEADLINE_US) {
                         return abort(bit);
                     }
+                }
+                seen = bus.micros() - t0;
+                const uint32_t rise = seen - start;
+                if (rise > RISE_DEADLINE_US) {
+                    return abort(bit);
                 }
                 if (rise > out.rise_us) {
                     out.rise_us = static_cast<uint16_t>(rise);
                 }
                 watching = true;
             }
-            uint32_t seen = bus.micros() - t0;
             while (seen < end) {
                 if (bus.low()) {
                     return abort(bit);

@@ -50,17 +50,25 @@ struct SimBus {
         : now(start)
     {
     }
-    uint32_t micros()
+    void tick(int64_t us)
     {
-        now += step;
+        now += us;
         if (now >= stall_at) {
             now += stall_len;
             stall_at = INT64_MAX;
         }
+    }
+    uint32_t micros()
+    {
+        tick(step);
         return static_cast<uint32_t>(now);
     }
+    // The line does not follow our pull (a dead output stage).
+    bool dead = false;
     void drive(bool low)
     {
+        // Pin access takes time too, and a stall can land right before it.
+        tick(1);
         if (low && !driving) {
             drive_start = now;
         } else if (!low && driving) {
@@ -69,9 +77,10 @@ struct SimBus {
         }
         driving = low;
     }
-    bool low() const
+    bool low()
     {
-        return driving || now < released_at + rise || (now >= pulse.from && now < pulse.to);
+        tick(1);
+        return (driving && !dead) || (!dead && now < released_at + rise) || (now >= pulse.from && now < pulse.to);
     }
     std::vector<Interval> line() const
     {
@@ -205,7 +214,7 @@ void clean_frame_is_delivered()
             QueryTxInfo info;
             CHECK(send_query_checked(bus, byte, &info) == QueryTxResult::SENT);
             CHECK(info.aborted_at == -1);
-            CHECK(info.rise_us >= rise && info.rise_us <= rise + 2 * bus.step);
+            CHECK(info.rise_us >= rise && info.rise_us <= rise + 30);
             for (const auto& opener : openers()) {
                 // A slow line with an early-sampling, fast-clocked opener can
                 // lose the stop bit after a low parity bit; that is the
@@ -297,7 +306,7 @@ void stall_never_makes_a_command()
     int aborted = 0;
     for (uint8_t byte : { 0x38, 0x39, 0x3A }) {
         for (int64_t length : { 150, 300, 450, 600, 900, 1300, 2500 }) {
-            for (int64_t at = -900; at < 9500; at += 13) {
+            for (int64_t at = -900; at < 9500; at += 3) {
                 SimBus bus(START);
                 bus.stall_at = frame_start() + at;
                 bus.stall_len = length;
@@ -358,6 +367,16 @@ void abort_reports_pulse_width()
     CHECK(info.low_us > 350 && info.low_us <= 410);
 }
 
+void dead_output_is_reported()
+{
+    SimBus bus(START);
+    bus.dead = true;
+    QueryTxInfo info;
+    CHECK(send_query_checked(bus, 0x38, &info) == QueryTxResult::ABORTED);
+    CHECK(info.no_drive && info.aborted_at == 0);
+    CHECK(bus.locks == 0 && !bus.driving);
+}
+
 void slow_line_is_aborted()
 {
     SimBus bus(START);
@@ -379,6 +398,7 @@ int main(int argc, char** argv)
         { "stall_with_pulse_never_makes_a_command", stall_with_pulse_never_makes_a_command },
         { "forced_abort_is_not_a_command", forced_abort_is_not_a_command },
         { "abort_reports_pulse_width", abort_reports_pulse_width },
+        { "dead_output_is_reported", dead_output_is_reported },
         { "slow_line_is_aborted", slow_line_is_aborted },
     };
     try {
