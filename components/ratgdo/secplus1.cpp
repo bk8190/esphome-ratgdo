@@ -103,7 +103,7 @@ namespace secplus1 {
     // An aborted checked query is sent again once, this much later. The bus
     // carries interfering pulses about every 102 ms, often several periods
     // running, so the retry aims for the middle of a period (2.5 periods).
-    static constexpr uint32_t QUERY_RETRY_DELAY = 256;
+    static constexpr uint32_t QUERY_RETRY_DELAY = 250;
     static constexpr uint8_t ABORT_TEST_FRAMES = 30;
     static constexpr uint32_t ABORT_TEST_INTERVAL = 300;
     // After a hint that the door may be about to move (a wall-panel press, or
@@ -1287,9 +1287,9 @@ namespace secplus1 {
             this->last_rx_ = this->last_tx_;
             this->tx_query_retried_ = false;
 #if RATGDO_SECPLUS1_DIAGNOSTICS
-            ESP_LOGD(TAG, "[%" PRIu32 "] Sent byte: [%02X] tx_gap=%" PRIu32 " rx_gap=%" PRIu32 " fall=%uus rise=%uus late=%uus queued=%u",
+            ESP_LOGD(TAG, "[%" PRIu32 "] Sent byte: [%02X] tx_gap=%" PRIu32 " rx_gap=%" PRIu32 " pulse=%uus fall=%uus rise=%uus late=%uus queued=%u",
                 millis(), value, this->last_tx_ - previous_tx, this->last_tx_ - previous_rx,
-                info.fall_us, info.rise_us, info.late_us, static_cast<unsigned>(this->pending_tx_.size()));
+                info.pulse_us, info.fall_us, info.rise_us, info.late_us, static_cast<unsigned>(this->pending_tx_.size()));
 #else
             ESP_LOGD(TAG, "[%" PRIu32 "] Sent byte: [%02X]", millis(), value);
 #endif
@@ -1297,9 +1297,9 @@ namespace secplus1 {
         }
 
         ++this->tx_query_aborts_;
-        ESP_LOGD(TAG, "[%" PRIu32 "] Query [%02X] %s (bit %d, low=%uus rise=%uus late=%uus, tx_gap=%" PRIu32 " rx_gap=%" PRIu32 "). Count=%" PRIu32,
+        ESP_LOGD(TAG, "[%" PRIu32 "] Query [%02X] %s (bit %d, low=%uus pulse=%uus rise=%uus late=%uus, tx_gap=%" PRIu32 " rx_gap=%" PRIu32 "). Count=%" PRIu32,
             millis(), value, result == QueryTxResult::BUSY ? "not sent, bus busy" : (info.no_drive ? "aborted, line did not go low" : "aborted"), info.aborted_at,
-            info.low_us, info.rise_us, info.late_us, this->last_tx_ - previous_tx, this->last_tx_ - previous_rx, this->tx_query_aborts_);
+            info.low_us, info.pulse_us, info.rise_us, info.late_us, this->last_tx_ - previous_tx, this->last_tx_ - previous_rx, this->tx_query_aborts_);
         this->publish_door_command_stats_();
         this->note_door_press_gate_reply_(false);
         if (abort_at_data_bit >= 0) {
@@ -1341,10 +1341,12 @@ namespace secplus1 {
         this->transmit_byte(static_cast<uint8_t>(CommandType::QUERY_DOOR_STATUS));
         count = this->uart_.scope_capture(1500000, edges, 160);
         log_edges("after 0x38", 1500, count);
+#if RATGDO_SECPLUS1_BUS_SCOPE >= 2
         this->phase_test_trial_ = 0;
         this->scheduler_->set_timeout(this->ratgdo_, TIMEOUT_ABORT_TEST, 3000, [this] {
             this->phase_test_step_();
         });
+#endif
     }
 
     // Which start times, relative to the bus's periodic pulse, does the

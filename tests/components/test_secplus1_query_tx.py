@@ -48,6 +48,8 @@ def query_tx_runner(tmp_path_factory):
         "clean_frame_is_delivered",
         "timer_wraparound",
         "busy_line_is_left_alone",
+        "frame_fits_between_periodic_pulses",
+        "wide_periodic_pulses_never_make_a_command",
         "unchecked_sender_can_emit_press",
         "pulse_never_makes_a_command",
         "stall_never_makes_a_command",

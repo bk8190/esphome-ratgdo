@@ -35,6 +35,18 @@ struct SimBus {
     int64_t step = 5;
     int64_t rise = 0;
     Interval pulse { 0, 0 };
+    // The bus's idle-state pulse train: low for train_width every
+    // train_period, the first at train_from.
+    int64_t train_from = 0;
+    int64_t train_period = 0;
+    int64_t train_width = 0;
+    bool in_train(int64_t t) const
+    {
+        if (!train_period || t < train_from) {
+            return false;
+        }
+        return (t - train_from) % train_period < train_width;
+    }
     // A stall models a non-maskable interrupt: time jumps while we do nothing.
     int64_t stall_at = INT64_MAX;
     int64_t stall_len = 0;
@@ -80,13 +92,18 @@ struct SimBus {
     bool low()
     {
         tick(1);
-        return (driving && !dead) || (!dead && now < released_at + rise) || (now >= pulse.from && now < pulse.to);
+        return (driving && !dead) || (!dead && now < released_at + rise) || (now >= pulse.from && now < pulse.to) || in_train(now);
     }
     std::vector<Interval> line() const
     {
         auto all = driven;
         if (pulse.to > pulse.from) {
             all.push_back(pulse);
+        }
+        if (train_period) {
+            for (int64_t at = train_from; at < now + 20000; at += train_period) {
+                all.push_back({ at, at + train_width });
+            }
         }
         std::sort(all.begin(), all.end(), [](const Interval& a, const Interval& b) { return a.from < b.from; });
         std::vector<Interval> merged;
@@ -203,7 +220,7 @@ static bool any_command(const SimBus& bus)
 
 static constexpr int64_t START = 1000000;
 // Where the frame begins once the listen window has passed.
-static int64_t frame_start() { return START + query_tx::PRE_LISTEN_US + query_tx::LISTEN_US + 20; }
+static int64_t frame_start() { return START + query_tx::PULSE_WAIT_US + query_tx::LISTEN_US + 30; }
 
 void clean_frame_is_delivered()
 {
@@ -243,19 +260,69 @@ void timer_wraparound()
 
 void busy_line_is_left_alone()
 {
+    // A low too long to be the periodic pulse.
     SimBus bus(START);
-    bus.pulse = { START + 200, START + 600 };
+    bus.pulse = { START + 200, START + 2200 };
     QueryTxInfo info;
     CHECK(send_query_checked(bus, 0x38, &info) == QueryTxResult::BUSY);
     CHECK(bus.driven.empty());
-    CHECK(info.low_us > 350 && info.low_us <= 410);
+    CHECK(info.low_us > 1000);
     CHECK(bus.locks == 0);
 
     // Busy inside the critical section releases it too.
     SimBus late(START);
-    late.pulse = { START + query_tx::PRE_LISTEN_US + 300, START + query_tx::PRE_LISTEN_US + 500 };
+    late.pulse = { START + query_tx::PULSE_WAIT_US + 100, START + query_tx::PULSE_WAIT_US + 300 };
     CHECK(send_query_checked(late, 0x38) == QueryTxResult::BUSY);
     CHECK(late.driven.empty() && late.locks == 0);
+}
+
+// On an idle bus the frame is slotted between two periodic pulses: it is
+// delivered whole, whatever the phase, and never aborted.
+void frame_fits_between_periodic_pulses()
+{
+    for (uint8_t byte : { 0x38, 0x39, 0x3A }) {
+        for (int64_t width : { 180, 250, 320 }) {
+            for (int64_t phase = 0; phase < 12240; phase += 97) {
+                SimBus bus(START);
+                bus.train_from = START - 50000 + phase;
+                bus.train_period = 12240;
+                bus.train_width = width;
+                QueryTxInfo info;
+                const auto result = send_query_checked(bus, byte, &info);
+                if (result == QueryTxResult::BUSY) {
+                    continue; // the wait ended right at a pulse
+                }
+                CHECK(result == QueryTxResult::SENT);
+                CHECK(info.pulse_us >= width - 10 && info.pulse_us <= width + 20);
+                // Pulses this narrow are not start bits to any opener variant.
+                for (const auto& opener : openers()) {
+                    const auto bytes = decode(bus.line(), opener);
+                    CHECK(bytes.size() == 1 && bytes[0] == byte);
+                }
+                CHECK(!any_command(bus));
+            }
+        }
+    }
+}
+
+// Wider pulses of the same train can read as start bits. Whatever the opener
+// makes of them and our frame, it is not a command.
+void wide_periodic_pulses_never_make_a_command()
+{
+    int sent = 0;
+    for (uint8_t byte : { 0x38, 0x39, 0x3A }) {
+        for (int64_t width : { 420, 500, 600, 690, 900, 2000 }) {
+            for (int64_t phase = 0; phase < 12240; phase += 61) {
+                SimBus bus(START);
+                bus.train_from = START - 50000 + phase;
+                bus.train_period = 12240;
+                bus.train_width = width;
+                sent += send_query_checked(bus, byte) == QueryTxResult::SENT;
+                CHECK(!any_command(bus));
+            }
+        }
+    }
+    CHECK(sent > 500);
 }
 
 // The failure in the field: a short low pulse on bit 3 of 0x38 is a press.
@@ -282,9 +349,9 @@ void pulse_never_makes_a_command()
     int aborted = 0, sent = 0, busy = 0;
     for (uint8_t byte : { 0x38, 0x39, 0x3A }) {
         for (int64_t rise : { 0, 100, 200 }) {
-            for (int64_t width : { 5, 30, 100, 200, 417, 600, 833, 1000, 1700, 2600, 4200, 7000 }) {
+            for (int64_t width : { 30, 100, 200, 417, 600, 833, 1000, 1700, 2600, 4200, 7000 }) {
                 int variant = 0;
-                for (int64_t at = -17000; at < 12500; at += 17) {
+                for (int64_t at = -17000; at < 26000; at += 17) {
                     SimBus bus(START + (variant++ % 5));
                     bus.rise = rise;
                     bus.pulse = { frame_start() + at, frame_start() + at + width + rise };
@@ -392,6 +459,8 @@ int main(int argc, char** argv)
         { "clean_frame_is_delivered", clean_frame_is_delivered },
         { "timer_wraparound", timer_wraparound },
         { "busy_line_is_left_alone", busy_line_is_left_alone },
+        { "frame_fits_between_periodic_pulses", frame_fits_between_periodic_pulses },
+        { "wide_periodic_pulses_never_make_a_command", wide_periodic_pulses_never_make_a_command },
         { "unchecked_sender_can_emit_press", unchecked_sender_can_emit_press },
         { "pulse_never_makes_a_command", pulse_never_makes_a_command },
         { "stall_never_makes_a_command", stall_never_makes_a_command },

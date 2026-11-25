@@ -16,11 +16,21 @@
 // line then carries a low pulse of a few bit times, which the bus already
 // carries naturally.
 //
-// Before sending it requires the line to have been idle for a whole frame
-// time. Otherwise a wide low pulse that ended just before our start bit could
-// have started a frame in the opener, and our start bit would land in that
-// frame as data: a 5-bit low, 2 idle bits, then our start bit reads as 0x30
-// to a receiver that does not check the stop bit.
+// When to start. With nothing talking to it, the opener's bus carries a low
+// pulse of about 200 us every 12.24 ms. An answered query stops the pulses for
+// about 3.9 s. A 9.2 ms frame fits between two pulses only if it starts right
+// after one, so:
+//  - if a pulse is seen, the frame starts START_AFTER_PULSE_US after it ends;
+//  - if the line stays idle for longer than a pulse period, the bus is in its
+//    quiet state and the frame starts at once;
+//  - a low longer than PULSE_MAX_US is something else, and nothing is sent.
+// Starting only after a low shorter than a bit, or after more than a frame of
+// idle, also rules out our start bit landing as data in a frame the opener
+// began on a longer low (a 5-bit low, 2 idle bits, then a start bit reads as
+// 0x30 to a receiver that does not check the stop bit).
+//
+// The bus is polled every few microseconds; a glitch shorter than that can be
+// missed.
 //
 // Assumption: the opener samples each bit no earlier than RISE_DEADLINE_US
 // into it (a UART samples near the middle).
@@ -57,16 +67,27 @@ struct QueryTxInfo {
     // How long the line then stayed low, up to LOW_MEASURE_CAP_US. Also set
     // for BUSY. Zero when the abort was for timing.
     uint16_t low_us { 0 };
+    // Width of the periodic pulse the frame was started after; zero when the
+    // bus was quiet.
+    uint16_t pulse_us { 0 };
 };
 
 namespace query_tx {
     // 1200 baud.
     constexpr uint32_t bit_us(uint8_t bit) { return (static_cast<uint32_t>(bit) * 10000U) / 12U; }
     static constexpr uint8_t FRAME_BITS = 11; // start, 8 data, even parity, stop
-    // The line must be idle this long before the start bit: PRE_LISTEN_US
-    // with interrupts on, then LISTEN_US inside the critical section.
-    static constexpr uint32_t PRE_LISTEN_US = bit_us(10);
-    static constexpr uint32_t LISTEN_US = bit_us(1);
+    // Wait this long for a periodic pulse before treating the bus as quiet.
+    // Longer than the pulse period (12.24 ms) and than a frame.
+    static constexpr uint32_t PULSE_WAIT_US = 13500;
+    // A low longer than this is not the periodic pulse.
+    static constexpr uint32_t PULSE_MAX_US = 700;
+    // The frame starts this long after a pulse ends, give or take
+    // START_SLACK_US. More than half a bit, so a receiver that took the pulse
+    // for a start bit has rejected it before ours begins.
+    static constexpr uint32_t START_AFTER_PULSE_US = 600;
+    static constexpr uint32_t START_SLACK_US = 150;
+    // On a quiet bus, a last look inside the critical section.
+    static constexpr uint32_t LISTEN_US = bit_us(1) / 2;
     // An edge this late is treated as a corrupted frame.
     static constexpr uint32_t LATE_US = bit_us(1) / 8;
     // While watching a released bit, a gap this long between two looks at the
@@ -116,15 +137,39 @@ RATGDO_QUERY_TX_INLINE QueryTxResult send_query_checked(Bus& bus, uint8_t byte, 
         out.low_us = static_cast<uint16_t>(held);
     };
 
-    // Only a low of about half a bit or more can start a frame in the
-    // opener, so interrupts may stay on for most of the wait.
-    const uint32_t pre_listen_start = bus.micros();
-    do {
-        if (bus.low()) {
-            time_low();
-            return QueryTxResult::BUSY;
+    // Find the slot. Interrupts stay on until the pulse has ended.
+    uint32_t waited_from = bus.micros();
+    uint32_t pulse_rise = 0;
+    bool synced = false;
+    if (bus.low()) {
+        // A low already in progress: its start was not seen, so let it end
+        // and start the wait again.
+        const uint32_t from = waited_from;
+        while (bus.low()) {
+            if (bus.micros() - from > PULSE_MAX_US) {
+                time_low();
+                return QueryTxResult::BUSY;
+            }
         }
-    } while (bus.micros() - pre_listen_start < PRE_LISTEN_US);
+        waited_from = bus.micros();
+    }
+    while (bus.micros() - waited_from < PULSE_WAIT_US) {
+        if (bus.low()) {
+            const uint32_t fell = bus.micros();
+            uint32_t width = 0;
+            while (bus.low()) {
+                width = bus.micros() - fell;
+                if (width > PULSE_MAX_US) {
+                    time_low();
+                    return QueryTxResult::BUSY;
+                }
+            }
+            pulse_rise = bus.micros();
+            out.pulse_us = static_cast<uint16_t>(pulse_rise - fell);
+            synced = true;
+            break;
+        }
+    }
 
     struct Critical {
         Bus& bus;
@@ -136,13 +181,32 @@ RATGDO_QUERY_TX_INLINE QueryTxResult send_query_checked(Bus& bus, uint8_t byte, 
         RATGDO_QUERY_TX_INLINE ~Critical() { bus.unlock(); }
     } critical(bus);
 
-    const uint32_t listen_start = bus.micros();
-    do {
-        if (bus.low()) {
-            time_low();
+    if (synced) {
+        // Hold off to a fixed point after the pulse. If something delayed us
+        // past it, the slot is gone.
+        uint32_t since = bus.micros() - pulse_rise;
+        if (since > START_AFTER_PULSE_US + START_SLACK_US) {
             return QueryTxResult::BUSY;
         }
-    } while (bus.micros() - listen_start < LISTEN_US);
+        while (since < START_AFTER_PULSE_US) {
+            if (bus.low()) {
+                time_low();
+                return QueryTxResult::BUSY;
+            }
+            since = bus.micros() - pulse_rise;
+        }
+        if (since > START_AFTER_PULSE_US + START_SLACK_US) {
+            return QueryTxResult::BUSY;
+        }
+    } else {
+        const uint32_t listen_start = bus.micros();
+        do {
+            if (bus.low()) {
+                time_low();
+                return QueryTxResult::BUSY;
+            }
+        } while (bus.micros() - listen_start < LISTEN_US);
+    }
 
     const uint16_t frame = frame_bits(byte);
     const uint32_t t0 = bus.micros();
