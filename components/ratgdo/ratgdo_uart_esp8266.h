@@ -52,22 +52,22 @@ public:
     // Send one Security+ 1.0 query bit by bit with interrupts off, reading the
     // bus back while it is released. See secplus1_query_tx.h. Nothing of the
     // frame is received through SoftwareSerial; the caller stands in for the
-    // echo when the result is SENT.
-    secplus1::QueryTxResult send_query_checked(uint8_t byte, secplus1::QueryTxInfo* info = nullptr, int8_t spoil_from_data_bit = -1)
+    // echo when the result is SENT. Blocks for about two frame times.
+    secplus1::QueryTxResult send_query_checked(uint8_t byte, secplus1::QueryTxInfo* info = nullptr, int8_t abort_at_data_bit = -1)
     {
         struct Bus {
             uint8_t tx;
             uint8_t rx;
             bool invert;
+            uint32_t saved_ps { 0 };
+            void lock() { saved_ps = xt_rsil(15); }
+            void unlock() { xt_wsr_ps(saved_ps); }
             uint32_t micros() { return ::micros(); }
             // Inverted: a high pin pulls the bus low.
             void drive(bool low) { ::digitalWrite(tx, low == invert ? HIGH : LOW); }
             bool low() { return (::digitalRead(rx) == HIGH) == invert; }
         } bus { static_cast<uint8_t>(this->tx_pin_), static_cast<uint8_t>(this->rx_pin_), this->invert_ };
-        const uint32_t saved = xt_rsil(15);
-        const auto result = secplus1::send_query_checked(bus, byte, info, spoil_from_data_bit);
-        xt_wsr_ps(saved);
-        return result;
+        return secplus1::send_query_checked(bus, byte, info, abort_at_data_bit);
     }
 
     // Fallback for SECPLUS2 preamble on ESP8266

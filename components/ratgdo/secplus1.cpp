@@ -30,12 +30,12 @@
 #define RATGDO_SECPLUS1_IDLE_PROBE_MS 300000
 #endif
 // Supervised hardware test only: the Query status button sends a burst of
-// deliberately spoiled queries, to confirm the opener ignores them.
-#ifndef RATGDO_SECPLUS1_SPOIL_TEST
-#define RATGDO_SECPLUS1_SPOIL_TEST 0
+// deliberately abandoned queries, to confirm the opener ignores them.
+#ifndef RATGDO_SECPLUS1_ABORT_TEST
+#define RATGDO_SECPLUS1_ABORT_TEST 0
 #endif
-#if RATGDO_SECPLUS1_SPOIL_TEST && !RATGDO_SECPLUS1_CHECKED_QUERY_TX
-#error "RATGDO_SECPLUS1_SPOIL_TEST needs RATGDO_SECPLUS1_CHECKED_QUERY_TX"
+#if RATGDO_SECPLUS1_ABORT_TEST && !RATGDO_SECPLUS1_CHECKED_QUERY_TX
+#error "RATGDO_SECPLUS1_ABORT_TEST needs RATGDO_SECPLUS1_CHECKED_QUERY_TX"
 #endif
 
 namespace esphome::ratgdo {
@@ -89,10 +89,12 @@ namespace secplus1 {
     // ratgdo cannot see (RF remote, mechanical) stays unreported. The checked
     // query sender removes that exposure and can use a short interval again.
     static constexpr uint32_t DOOR_STATUS_IDLE_INTERVAL = RATGDO_SECPLUS1_IDLE_PROBE_MS;
-    // An aborted checked query is sent again once, this much later.
-    static constexpr uint32_t QUERY_RETRY_DELAY = 300;
-    static constexpr uint8_t SPOIL_TEST_FRAMES = 30;
-    static constexpr uint32_t SPOIL_TEST_INTERVAL = 300;
+    // An aborted checked query is sent again once, this much later. The bus
+    // carries interfering pulses about every 102 ms, often several periods
+    // running, so the retry aims for the middle of a period (2.5 periods).
+    static constexpr uint32_t QUERY_RETRY_DELAY = 256;
+    static constexpr uint8_t ABORT_TEST_FRAMES = 30;
+    static constexpr uint32_t ABORT_TEST_INTERVAL = 300;
     // After a hint that the door may be about to move (a wall-panel press, or
     // one of our queries read back as a press), probe fast for this long so
     // the movement is reported promptly despite the slow idle rate.
@@ -802,9 +804,9 @@ namespace secplus1 {
     Result Secplus1::call(Args args)
     {
         if (args.tag == Args::Tag::query_status) {
-#if RATGDO_SECPLUS1_SPOIL_TEST
-            this->spoil_test_remaining_ = SPOIL_TEST_FRAMES;
-            this->spoil_test_step_();
+#if RATGDO_SECPLUS1_ABORT_TEST
+            this->abort_test_remaining_ = ABORT_TEST_FRAMES;
+            this->abort_test_step_();
             return { };
 #endif
             this->enqueue_transmit(CommandType::QUERY_DOOR_STATUS);
@@ -1252,12 +1254,12 @@ namespace secplus1 {
     }
 
 #if RATGDO_SECPLUS1_CHECKED_QUERY_TX
-    void Secplus1::transmit_query_checked_(uint8_t value, int8_t spoil_from_data_bit)
+    void Secplus1::transmit_query_checked_(uint8_t value, int8_t abort_at_data_bit)
     {
         const auto previous_tx = this->last_tx_;
         const auto previous_rx = this->last_rx_;
         QueryTxInfo info;
-        const auto result = this->uart_.send_query_checked(value, &info, spoil_from_data_bit);
+        const auto result = this->uart_.send_query_checked(value, &info, abort_at_data_bit);
         this->last_tx_ = millis();
         // Interrupts were off for the frame, so none of it was received.
         // Anything half-read before it is stale.
@@ -1281,12 +1283,12 @@ namespace secplus1 {
         }
 
         ++this->tx_query_aborts_;
-        ESP_LOGD(TAG, "[%" PRIu32 "] Query [%02X] %s (bit %d, rise=%uus late=%uus, tx_gap=%" PRIu32 " rx_gap=%" PRIu32 "). Count=%" PRIu32,
-            millis(), value, result == QueryTxResult::BUSY ? "not sent, bus busy" : "spoiled", info.spoiled_at,
-            info.rise_us, info.late_us, this->last_tx_ - previous_tx, this->last_tx_ - previous_rx, this->tx_query_aborts_);
+        ESP_LOGD(TAG, "[%" PRIu32 "] Query [%02X] %s (bit %d, low=%uus rise=%uus late=%uus, tx_gap=%" PRIu32 " rx_gap=%" PRIu32 "). Count=%" PRIu32,
+            millis(), value, result == QueryTxResult::BUSY ? "not sent, bus busy" : "aborted", info.aborted_at,
+            info.low_us, info.rise_us, info.late_us, this->last_tx_ - previous_tx, this->last_tx_ - previous_rx, this->tx_query_aborts_);
         this->publish_door_command_stats_();
         this->note_door_press_gate_reply_(false);
-        if (spoil_from_data_bit >= 0) {
+        if (abort_at_data_bit >= 0) {
             return; // deliberate, from the hardware test
         }
         // Send it again once. A second failure waits for the next probe, so a
@@ -1300,24 +1302,24 @@ namespace secplus1 {
     }
 #endif
 
-#if RATGDO_SECPLUS1_SPOIL_TEST
-    void Secplus1::spoil_test_step_()
+#if RATGDO_SECPLUS1_ABORT_TEST
+    void Secplus1::abort_test_step_()
     {
-        if (this->spoil_test_remaining_ == 0) {
-            ESP_LOGI(TAG, "Spoil test finished; querying door status");
+        if (this->abort_test_remaining_ == 0) {
+            ESP_LOGI(TAG, "Abort test finished; querying door status");
             this->enqueue_transmit(CommandType::QUERY_DOOR_STATUS, millis() + 500);
             this->enqueue_transmit(CommandType::QUERY_DOOR_STATUS, millis() + 3000);
             return;
         }
         if (this->pending_tx_.empty() && millis() - this->last_tx_ > 200 && millis() - this->last_rx_ > 50) {
-            // Data bits 3, 4 and 5 are the ones a 0x38 releases.
-            const int8_t data_bit = 3 + (this->spoil_test_remaining_ % 3);
-            --this->spoil_test_remaining_;
-            ESP_LOGI(TAG, "Spoil test: 0x38 spoiled at data bit %d, %u left", data_bit, this->spoil_test_remaining_);
-            this->transmit_query_checked_(static_cast<uint8_t>(CommandType::QUERY_DOOR_STATUS), data_bit);
+            // A 0x38 abandoned at data bit 3 is the worst case the sender can
+            // leave on the bus: the start bit and three low data bits.
+            --this->abort_test_remaining_;
+            ESP_LOGI(TAG, "Abort test: 0x38 abandoned at data bit 3, %u left", this->abort_test_remaining_);
+            this->transmit_query_checked_(static_cast<uint8_t>(CommandType::QUERY_DOOR_STATUS), 3);
         }
-        this->scheduler_->set_timeout(this->ratgdo_, TIMEOUT_SPOIL_TEST, SPOIL_TEST_INTERVAL, [this] {
-            this->spoil_test_step_();
+        this->scheduler_->set_timeout(this->ratgdo_, TIMEOUT_ABORT_TEST, ABORT_TEST_INTERVAL, [this] {
+            this->abort_test_step_();
         });
     }
 #endif

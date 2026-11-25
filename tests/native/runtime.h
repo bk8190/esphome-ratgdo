@@ -116,12 +116,12 @@ namespace ratgdo {
         // byte is not. The next `abort_queries` queries are not delivered.
         int abort_queries = 0;
         int aborted = 0;
-        secplus1::QueryTxResult send_query_checked(uint8_t byte, secplus1::QueryTxInfo* = nullptr, int8_t spoil_from_data_bit = -1)
+        secplus1::QueryTxResult send_query_checked(uint8_t byte, secplus1::QueryTxInfo* = nullptr, int8_t abort_at_data_bit = -1)
         {
-            if (abort_queries > 0 || spoil_from_data_bit >= 0) {
+            if (abort_queries > 0 || abort_at_data_bit >= 0) {
                 abort_queries -= abort_queries > 0;
                 ++aborted;
-                return secplus1::QueryTxResult::SPOILED;
+                return secplus1::QueryTxResult::ABORTED;
             }
             tx.emplace_back(millis(), byte);
             if (respond) {

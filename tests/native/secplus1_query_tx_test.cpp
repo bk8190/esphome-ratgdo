@@ -39,6 +39,9 @@ struct SimBus {
     int64_t stall_at = INT64_MAX;
     int64_t stall_len = 0;
     bool driving = false;
+    int locks = 0;
+    void lock() { ++locks; }
+    void unlock() { --locks; }
     int64_t released_at = INT64_MIN / 2;
     int64_t drive_start = 0;
     std::vector<Interval> driven;
@@ -191,7 +194,7 @@ static bool any_command(const SimBus& bus)
 
 static constexpr int64_t START = 1000000;
 // Where the frame begins once the listen window has passed.
-static int64_t frame_start() { return START + query_tx::LISTEN_US + 10; }
+static int64_t frame_start() { return START + query_tx::PRE_LISTEN_US + query_tx::LISTEN_US + 20; }
 
 void clean_frame_is_delivered()
 {
@@ -201,7 +204,7 @@ void clean_frame_is_delivered()
             bus.rise = rise;
             QueryTxInfo info;
             CHECK(send_query_checked(bus, byte, &info) == QueryTxResult::SENT);
-            CHECK(info.spoiled_at == -1);
+            CHECK(info.aborted_at == -1);
             CHECK(info.rise_us >= rise && info.rise_us <= rise + 2 * bus.step);
             for (const auto& opener : openers()) {
                 // A slow line with an early-sampling, fast-clocked opener can
@@ -233,8 +236,17 @@ void busy_line_is_left_alone()
 {
     SimBus bus(START);
     bus.pulse = { START + 200, START + 600 };
-    CHECK(send_query_checked(bus, 0x38) == QueryTxResult::BUSY);
+    QueryTxInfo info;
+    CHECK(send_query_checked(bus, 0x38, &info) == QueryTxResult::BUSY);
     CHECK(bus.driven.empty());
+    CHECK(info.low_us > 350 && info.low_us <= 410);
+    CHECK(bus.locks == 0);
+
+    // Busy inside the critical section releases it too.
+    SimBus late(START);
+    late.pulse = { START + query_tx::PRE_LISTEN_US + 300, START + query_tx::PRE_LISTEN_US + 500 };
+    CHECK(send_query_checked(late, 0x38) == QueryTxResult::BUSY);
+    CHECK(late.driven.empty() && late.locks == 0);
 }
 
 // The failure in the field: a short low pulse on bit 3 of 0x38 is a press.
@@ -258,17 +270,17 @@ void unchecked_sender_can_emit_press()
 
 void pulse_never_makes_a_command()
 {
-    int spoiled = 0, sent = 0, busy = 0;
+    int aborted = 0, sent = 0, busy = 0;
     for (uint8_t byte : { 0x38, 0x39, 0x3A }) {
         for (int64_t rise : { 0, 100, 200 }) {
-            for (int64_t width : { 30, 100, 200, 417, 600, 833, 1000, 1700, 2600 }) {
+            for (int64_t width : { 5, 30, 100, 200, 417, 600, 833, 1000, 1700, 2600, 4200, 7000 }) {
                 int variant = 0;
-                for (int64_t at = -2600; at < 12500; at += 17) {
+                for (int64_t at = -17000; at < 12500; at += 17) {
                     SimBus bus(START + (variant++ % 5));
                     bus.rise = rise;
                     bus.pulse = { frame_start() + at, frame_start() + at + width + rise };
                     const auto result = send_query_checked(bus, byte);
-                    spoiled += result == QueryTxResult::SPOILED;
+                    aborted += result == QueryTxResult::ABORTED;
                     sent += result == QueryTxResult::SENT;
                     busy += result == QueryTxResult::BUSY;
                     CHECK(!any_command(bus));
@@ -277,24 +289,24 @@ void pulse_never_makes_a_command()
         }
     }
     // The sweep must exercise every outcome to mean anything.
-    CHECK(spoiled > 1000 && sent > 1000 && busy > 1000);
+    CHECK(aborted > 1000 && sent > 1000 && busy > 1000);
 }
 
 void stall_never_makes_a_command()
 {
-    int spoiled = 0;
+    int aborted = 0;
     for (uint8_t byte : { 0x38, 0x39, 0x3A }) {
         for (int64_t length : { 150, 300, 450, 600, 900, 1300, 2500 }) {
             for (int64_t at = -900; at < 9500; at += 13) {
                 SimBus bus(START);
                 bus.stall_at = frame_start() + at;
                 bus.stall_len = length;
-                spoiled += send_query_checked(bus, byte) == QueryTxResult::SPOILED;
+                aborted += send_query_checked(bus, byte) == QueryTxResult::ABORTED;
                 CHECK(!any_command(bus));
             }
         }
     }
-    CHECK(spoiled > 1000);
+    CHECK(aborted > 1000);
 }
 
 void stall_with_pulse_never_makes_a_command()
@@ -313,27 +325,46 @@ void stall_with_pulse_never_makes_a_command()
     }
 }
 
-// The supervised hardware test deliberately spoils frames at each data bit.
-void forced_spoil_is_not_a_command()
+// The supervised hardware test deliberately abandons frames at a data bit.
+// Whatever is left on the line has bits 6 and 7 set.
+void forced_abort_is_not_a_command()
 {
     for (int8_t data_bit = 0; data_bit < 8; ++data_bit) {
         SimBus bus(START);
         QueryTxInfo info;
-        CHECK(send_query_checked(bus, 0x38, &info, data_bit) == QueryTxResult::SPOILED);
-        CHECK(info.spoiled_at == data_bit + 1);
+        CHECK(send_query_checked(bus, 0x38, &info, data_bit) == QueryTxResult::ABORTED);
+        CHECK(info.aborted_at == data_bit + 1);
+        CHECK(info.low_us == 0);
+        CHECK(bus.locks == 0);
         CHECK(!any_command(bus));
-        // An opener that checks the stop bit sees nothing at all.
-        CHECK(decode(bus.line(), Opener { }).empty());
+        if (data_bit <= 6) { // before either of bits 6 and 7 has been driven
+            for (const auto& opener : openers()) {
+                const auto bytes = decode(bus.line(), opener);
+                CHECK(bytes.size() == 1 && (bytes[0] & 0xC0) == 0xC0);
+            }
+        }
     }
 }
 
-void slow_line_is_spoiled()
+// A pulse that ends the frame is timed for the log.
+void abort_reports_pulse_width()
+{
+    SimBus bus(START);
+    const int64_t bit3 = frame_start() + static_cast<int64_t>(4 * BIT);
+    bus.pulse = { bit3 + 300, bit3 + 700 };
+    QueryTxInfo info;
+    CHECK(send_query_checked(bus, 0x38, &info) == QueryTxResult::ABORTED);
+    CHECK(info.aborted_at == 4);
+    CHECK(info.low_us > 350 && info.low_us <= 410);
+}
+
+void slow_line_is_aborted()
 {
     SimBus bus(START);
     bus.rise = 400; // slower than RISE_DEADLINE_US
     QueryTxInfo info;
-    CHECK(send_query_checked(bus, 0x38, &info) == QueryTxResult::SPOILED);
-    CHECK(info.spoiled_at == 4);
+    CHECK(send_query_checked(bus, 0x38, &info) == QueryTxResult::ABORTED);
+    CHECK(info.aborted_at == 4);
 }
 
 int main(int argc, char** argv)
@@ -346,8 +377,9 @@ int main(int argc, char** argv)
         { "pulse_never_makes_a_command", pulse_never_makes_a_command },
         { "stall_never_makes_a_command", stall_never_makes_a_command },
         { "stall_with_pulse_never_makes_a_command", stall_with_pulse_never_makes_a_command },
-        { "forced_spoil_is_not_a_command", forced_spoil_is_not_a_command },
-        { "slow_line_is_spoiled", slow_line_is_spoiled },
+        { "forced_abort_is_not_a_command", forced_abort_is_not_a_command },
+        { "abort_reports_pulse_width", abort_reports_pulse_width },
+        { "slow_line_is_aborted", slow_line_is_aborted },
     };
     try {
         CHECK(argc == 2);

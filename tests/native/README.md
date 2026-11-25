@@ -34,6 +34,6 @@ scenario suite above also runs with the checked sender enabled.
 These tests exercise software ordering and timing. Apart from that line model,
 they do not model electrical bus behavior, motor travel, obstruction hardware,
 or opener wake-up behavior. The real bus's rise time and the real opener's
-handling of an invalid frame are not established here.
+handling of an abandoned frame are not established here.
 Firmware builds and operator-supervised board tests remain necessary before
 hardware deployment or marking an upstream PR ready.

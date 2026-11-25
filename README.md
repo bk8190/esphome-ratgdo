@@ -67,10 +67,11 @@ A status query (`0x38`) differs from a door press (`0x30`) in one bit, and the
 bus is wired-AND, so a short low pulse on that bit turns a query into a press.
 With `-DRATGDO_SECPLUS1_CHECKED_QUERY_TX=1`, ratgdo sends queries bit by bit
 with interrupts off and reads the bus back while it releases each data bit. If
-the bus is low when it should be high, or an edge goes out late, it holds the
-line low through the stop bit so the frame is invalid. Such a query is counted
-by the `Door Queries Aborted` sensor (`type: door_tx_query_aborts`) and sent
-again once.
+the bus is low when it should be high, or an edge goes out late, it releases
+the line and sends nothing more. Every panel command has bits 6 and 7 clear,
+and those are the last bits a query drives, so what is left on the bus is not
+a command. Such a query is counted by the `Door Queries Aborted` sensor
+(`type: door_tx_query_aborts`) and sent again once.
 
 ```yaml
 esphome:
@@ -84,8 +85,8 @@ esphome:
 (default 300000). The sender assumes the bus reads idle within 250 µs of being
 released; diagnostics builds log the measured time as `rise=`.
 
-`-DRATGDO_SECPLUS1_SPOIL_TEST=1` is for a supervised hardware test only. The
-Query status button then sends 30 deliberately invalid queries, to confirm
+`-DRATGDO_SECPLUS1_ABORT_TEST=1` is for a supervised hardware test only. The
+Query status button then sends 30 deliberately abandoned queries, to confirm
 that the opener ignores them. Do not leave it flashed.
 
 ### Security+ 1.0 packet diagnostics

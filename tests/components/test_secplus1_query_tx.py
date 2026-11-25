@@ -3,7 +3,7 @@
 The sender is a template over the bus, so the production algorithm runs
 unchanged on a simulated wired-AND line with interfering pulses and timing
 stalls. A simulated opener UART decodes the line. These tests cannot establish
-the real bus's rise time or how the real opener treats a spoiled frame.
+the real bus's rise time or how the real opener treats an abandoned frame.
 """
 
 from pathlib import Path
@@ -52,8 +52,9 @@ def query_tx_runner(tmp_path_factory):
         "pulse_never_makes_a_command",
         "stall_never_makes_a_command",
         "stall_with_pulse_never_makes_a_command",
-        "forced_spoil_is_not_a_command",
-        "slow_line_is_spoiled",
+        "forced_abort_is_not_a_command",
+        "abort_reports_pulse_width",
+        "slow_line_is_aborted",
     ],
 )
 def test_query_tx_scenario(query_tx_runner, scenario):
