@@ -1320,18 +1320,26 @@ namespace secplus1 {
     void Secplus1::bus_scope_()
     {
         static uint32_t edges[160];
-        const auto count = this->uart_.scope_capture(400000, edges, 160);
-        ESP_LOGI(TAG, "[%" PRIu32 "] Bus scope: %u edges in 400ms, tx_age=%" PRIu32 " rx_age=%" PRIu32 " (L=went low, H=went high, microseconds)",
-            millis(), static_cast<unsigned>(count), millis() - this->last_tx_, millis() - this->last_rx_);
-        char line[160];
-        size_t used = 0;
-        for (size_t i = 0; i < count; ++i) {
-            used += snprintf(line + used, sizeof(line) - used, " %c%" PRIu32, (edges[i] & 1) ? 'L' : 'H', edges[i] >> 1);
-            if (used > sizeof(line) - 14 || i + 1 == count) {
-                ESP_LOGI(TAG, "scope:%s", line);
-                used = 0;
+        const auto log_edges = [&](const char* what, uint32_t duration_ms, size_t count) {
+            ESP_LOGI(TAG, "[%" PRIu32 "] Bus scope (%s): %u edges in %" PRIu32 "ms, tx_age=%" PRIu32 " rx_age=%" PRIu32 " (L=went low, H=went high, microseconds)",
+                millis(), what, static_cast<unsigned>(count), duration_ms, millis() - this->last_tx_, millis() - this->last_rx_);
+            char line[160];
+            size_t used = 0;
+            for (size_t i = 0; i < count; ++i) {
+                used += snprintf(line + used, sizeof(line) - used, " %c%" PRIu32, (edges[i] & 1) ? 'L' : 'H', edges[i] >> 1);
+                if (used > sizeof(line) - 14 || i + 1 == count) {
+                    ESP_LOGI(TAG, "scope:%s", line);
+                    used = 0;
+                }
             }
-        }
+        };
+        // The bus with nothing sent.
+        auto count = this->uart_.scope_capture(400000, edges, 160);
+        log_edges("idle", 400, count);
+        // One status query, then what follows it.
+        this->transmit_byte(static_cast<uint8_t>(CommandType::QUERY_DOOR_STATUS));
+        count = this->uart_.scope_capture(250000, edges, 160);
+        log_edges("after 0x38", 250, count);
     }
 #endif
 
